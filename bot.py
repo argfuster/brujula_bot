@@ -282,12 +282,18 @@ def get_binance_client() -> Client:
     return client
 
 def calc_qty(symbol: str, entry: float, risk_usdt: float, stop: float) -> float:
+def calc_qty(symbol: str, entry: float, risk_usdt: float, stop: float) -> float:
+    """
+    Calcula el tamaño de posición basado en el riesgo.
+    qty = RISK_USDT / risk_per_unit
+    El leverage no afecta el qty — solo el margen requerido.
+    """
     risk_per_unit = abs(entry - stop)
-    qty = (risk_usdt * LEVERAGE) / entry
-    # Size based on risk
-    qty_by_risk = risk_usdt / risk_per_unit
-    qty = min(qty, qty_by_risk)
-    # Get symbol precision
+    if risk_per_unit == 0:
+        return 0
+    qty = risk_usdt / risk_per_unit
+
+    # Round to symbol precision
     client = get_binance_client()
     info   = client.futures_exchange_info()
     for s in info['symbols']:
@@ -305,6 +311,21 @@ def execute_entry(sig: dict) -> dict | None:
         client.futures_change_leverage(symbol=sig['symbol'], leverage=LEVERAGE)
 
         qty  = calc_qty(sig['symbol'], sig['entry'], RISK_USDT, sig['stop'])
+        if qty <= 0:
+            log.error(f"Invalid qty calculated: {qty}")
+            return None
+
+        # Verify margin available
+        nocional = qty * sig['entry']
+        margen   = nocional / LEVERAGE
+        account  = client.futures_account()
+        available = float(account.get('availableBalance', 0))
+        if available < margen:
+            log.error(f"Insufficient margin: need ${margen:.2f}, have ${available:.2f}")
+            return None
+
+        log.info(f"Order size: {qty} BTC | Nocional: ${nocional:.2f} | Margen: ${margen:.2f} | Disponible: ${available:.2f}")
+
         side = SIDE_BUY if sig['dir'] == 'long' else SIDE_SELL
 
         order = client.futures_create_order(
