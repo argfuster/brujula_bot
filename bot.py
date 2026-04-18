@@ -549,16 +549,18 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ARG = UTC − 3
 # No abrir nuevas posiciones después de 20:00 ARG = 23:00 UTC
 # Cerrar todo a 00:00 ARG = 03:00 UTC
+# Configurables en Railway:
+ENTRY_CUTOFF_UTC = int(os.environ.get('ENTRY_CUTOFF_UTC', '23'))  # no nuevas entradas desde esta hora UTC
+DAILY_CLOSE_UTC  = int(os.environ.get('DAILY_CLOSE_UTC',  '3'))   # cierre forzado a esta hora UTC
 
 def is_entry_allowed() -> bool:
-    """Permite nuevas entradas solo hasta las 23:00 UTC (20:00 ARG)."""
-    h = datetime.now(timezone.utc).hour
-    return h < 23  # 23:00 UTC en adelante → no nuevas entradas
+    """Permite nuevas entradas solo hasta ENTRY_CUTOFF_UTC."""
+    return datetime.now(timezone.utc).hour < ENTRY_CUTOFF_UTC
 
 def is_daily_close_time() -> bool:
-    """Cierre diario a las 03:00 UTC (00:00 ARG)."""
+    """Cierre diario a DAILY_CLOSE_UTC."""
     now = datetime.now(timezone.utc)
-    return now.hour == 3 and now.minute < 15  # ventana de 15 min para asegurar ejecución
+    return now.hour == DAILY_CLOSE_UTC and now.minute < 15
 
 # ─── SCAN JOB ────────────────────────────────────────────────────────────────
 async def scan_job(app):
