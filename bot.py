@@ -33,8 +33,7 @@ LEVERAGE    = int(os.environ.get('LEVERAGE', '5'))
 RISK_USDT   = float(os.environ.get('RISK_USDT', '10'))   # USD en riesgo por operación
 EMA_PERIOD  = int(os.environ.get('EMA_PERIOD', '200'))
 VOL_MULT    = float(os.environ.get('VOL_MULT', '1.5'))
-RR_TARGET   = float(os.environ.get('RR_TARGET', '1.5'))  # activa trailing
-TRAIL_R     = float(os.environ.get('TRAIL_R', '0.5'))    # distancia trailing en R
+RR_TARGET   = float(os.environ.get('RR_TARGET', '2'))    # target fijo en R
 CONFIRM_MIN = int(os.environ.get('CONFIRM_MINUTES', '60'))
 
 # ─── STATE ───────────────────────────────────────────────────────────────────
@@ -230,7 +229,7 @@ DIR_EMOJI   = {'long': '🟢 LONG', 'short': '🔴 SHORT'}
 TYPE_LABEL  = {'SH': 'Stop Hunt', 'BRT': 'Break & Retest', 'SQ': 'Squeeze'}
 
 def format_signal_message(sig: dict) -> str:
-    emoji   = SETUP_EMOJI.get(sig['type'], '🔔')
+    emoji    = SETUP_EMOJI.get(sig['type'], '🔔')
     pct_stop = abs(sig['entry'] - sig['stop']) / sig['entry'] * 100
     pct_tgt  = abs(sig['entry'] - sig['target']) / sig['entry'] * 100
     bias_dir = 'sobre' if sig['dir'] == 'long' else 'bajo'
@@ -241,8 +240,7 @@ def format_signal_message(sig: dict) -> str:
         f"Dirección:  {DIR_EMOJI[sig['dir']]}\n"
         f"Entrada:    `{sig['entry']:,.2f}`\n"
         f"Stop:       `{sig['stop']:,.2f}`  _(−{pct_stop:.2f}%)_\n"
-        f"Target 1.5R: `{sig['target']:,.2f}`  _(+{pct_tgt:.2f}%)_\n"
-        f"Trailing:   `0.5R desde {sig['target']:,.2f}`\n\n"
+        f"Target 2R:  `{sig['target']:,.2f}`  _(+{pct_tgt:.2f}%)_\n\n"
         f"Sesgo 1h:   ✓ precio {bias_dir} EMA 200 ({sig['ema1h']:,.2f})\n\n"
         f"_Revisá orderflow en Exocharts antes de confirmar._\n"
         f"_Delta y CVD en tu dirección? Absorción en el nivel?_\n\n"
@@ -255,8 +253,8 @@ def format_trade_update(sig: dict, event: str, price: float = 0, rr: float = 0) 
             f"✅ *ORDEN EJECUTADA — {sig['symbol']}*\n\n"
             f"Setup: `{TYPE_LABEL[sig['type']]}` {DIR_EMOJI[sig['dir']]}\n"
             f"Entrada: `{price:,.2f}`\n"
-            f"Stop: `{sig['stop']:,.2f}`\n"
-            f"Trailing activo desde `{sig['target']:,.2f}` (1.5R)"
+            f"Stop:    `{sig['stop']:,.2f}` (−1R)\n"
+            f"Target:  `{sig['target']:,.2f}` (+2R)"
         )
     elif event == 'closed':
         emoji = '🏆' if rr > 0 else '🛑'
@@ -368,107 +366,62 @@ def close_position(symbol: str, qty: float, direction: str):
     except Exception as e:
         log.error(f"Close error: {e}")
 
-# ─── TRAILING MANAGER ─────────────────────────────────────────────────────────
-async def manage_trailing(app, sig: dict, trade: dict):
+# ─── FIXED RR MANAGER ────────────────────────────────────────────────────────
+async def manage_fixed_rr(app, sig: dict, trade: dict):
     """
-    Monitors position and manages trailing stop once price hits 1.5R target.
-    Runs as async task until position closes.
+    Monitorea la posición con RR fijo.
+    Cierra cuando el precio toca el target (2R) o el stop (−1R).
+    Binance ya tiene el stop order colocado — este loop monitorea el target.
     """
     symbol    = sig['symbol']
     direction = sig['dir']
     entry     = sig['entry']
     risk      = sig['risk']
     qty       = trade['qty']
-    target    = sig['target']   # 1.5R activation price
-    trail_gap = risk * TRAIL_R  # 0.5R in price terms
+    target    = entry + risk * RR_TARGET if direction == 'long' else entry - risk * RR_TARGET
+    client    = get_binance_client()
 
-    phase      = 0   # 0=watching, 1=trailing active
-    max_fav    = entry
-    trail_stop = None
-    client     = get_binance_client()
-
-    log.info(f"Trailing manager started for {symbol} {direction}")
+    log.info(f"RR monitor started: {symbol} {direction} | entry={entry:.2f} stop={sig['stop']:.2f} target={target:.2f}")
 
     while symbol in active_trades:
-        await asyncio.sleep(30)  # check every 30 seconds
+        await asyncio.sleep(30)
         try:
             ticker = client.futures_symbol_ticker(symbol=symbol)
             price  = float(ticker['price'])
 
-            # Update max favorable
-            if direction == 'long'  and price > max_fav: max_fav = price
-            if direction == 'short' and price < max_fav: max_fav = price
+            # Check target hit
+            hit_target = (direction == 'long' and price >= target) or \
+                         (direction == 'short' and price <= target)
 
-            # Phase 0 → 1: hit target, activate trailing
-            if phase == 0:
-                hit = (direction == 'long' and price >= target) or \
-                      (direction == 'short' and price <= target)
-                if hit:
-                    phase      = 1
-                    trail_stop = max_fav - trail_gap if direction == 'long' else max_fav + trail_gap
-                    log.info(f"Trailing activated @ {price:.2f}, trail_stop={trail_stop:.2f}")
-                    # Cancel original SL, place new one at trail_stop
-                    _update_stop(client, sig, trail_stop, qty)
+            # Check stop hit (in case Binance order didn't fire)
+            hit_stop = (direction == 'long' and price <= sig['stop']) or \
+                       (direction == 'short' and price >= sig['stop'])
 
-            # Phase 1: update trailing
-            elif phase == 1:
-                new_stop = max_fav - trail_gap if direction == 'long' else max_fav + trail_gap
-                if (direction == 'long'  and new_stop > trail_stop) or \
-                   (direction == 'short' and new_stop < trail_stop):
-                    trail_stop = new_stop
-                    _update_stop(client, sig, trail_stop, qty)
-                    log.info(f"Trail moved to {trail_stop:.2f} (max={max_fav:.2f})")
+            if hit_target:
+                # Close position at market
+                close_position(symbol, qty, direction)
+                rr = RR_TARGET
+                active_trades.pop(symbol, None)
+                await app.bot.send_message(
+                    chat_id    = TELEGRAM_CHAT_ID,
+                    text       = format_trade_update(sig, 'closed', target, rr),
+                    parse_mode = 'Markdown'
+                )
+                log.info(f"Target hit @ {price:.2f} (+{rr}R)")
+                return
 
-                # Check if stop was hit
-                hit_stop = (direction == 'long'  and price <= trail_stop) or \
-                           (direction == 'short' and price >= trail_stop)
-                if hit_stop:
-                    rr = (trail_stop - entry) / risk if direction == 'long' \
-                         else (entry - trail_stop) / risk
-                    active_trades.pop(symbol, None)
-                    await app.bot.send_message(
-                        chat_id = TELEGRAM_CHAT_ID,
-                        text    = format_trade_update(sig, 'closed', trail_stop, round(rr, 2)),
-                        parse_mode = 'Markdown'
-                    )
-                    log.info(f"Position closed by trailing @ {trail_stop:.2f} ({rr:.2f}R)")
-                    return
-
-            # Check if original SL hit (phase 0)
-            elif phase == 0:
-                hit_sl = (direction == 'long'  and price <= sig['stop']) or \
-                         (direction == 'short' and price >= sig['stop'])
-                if hit_sl:
-                    rr = -1.0
-                    active_trades.pop(symbol, None)
-                    await app.bot.send_message(
-                        chat_id = TELEGRAM_CHAT_ID,
-                        text    = format_trade_update(sig, 'closed', sig['stop'], rr),
-                        parse_mode = 'Markdown'
-                    )
-                    return
+            if hit_stop:
+                active_trades.pop(symbol, None)
+                await app.bot.send_message(
+                    chat_id    = TELEGRAM_CHAT_ID,
+                    text       = format_trade_update(sig, 'closed', sig['stop'], -1.0),
+                    parse_mode = 'Markdown'
+                )
+                log.info(f"Stop hit @ {price:.2f} (−1R)")
+                return
 
         except Exception as e:
-            log.error(f"Trailing error: {e}")
-
-def _update_stop(client, sig: dict, new_stop: float, qty: float):
-    """Cancel all open SL orders and place new one."""
-    try:
-        orders = client.futures_get_open_orders(symbol=sig['symbol'])
-        for o in orders:
-            if o.get('type') in ('STOP_MARKET', 'STOP') and o.get('reduceOnly'):
-                client.futures_cancel_order(symbol=sig['symbol'], orderId=o['orderId'])
-        sl_side = SIDE_SELL if sig['dir'] == 'long' else SIDE_BUY
-        client.futures_create_order(
-            symbol     = sig['symbol'],
-            side       = sl_side,
-            type       = 'STOP_MARKET',
-            stopPrice  = round(new_stop, 2),
-            quantity   = qty,
-            reduceOnly = True,
-        )
-    except Exception as e:
-        log.error(f"Stop update error: {e}")
+            log.error(f"RR monitor error: {e}")
 
 # ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
 async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,8 +460,8 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode = 'Markdown'
     )
 
-    # Start trailing manager
-    asyncio.create_task(manage_trailing(context.application, sig, trade))
+    # Start fixed RR monitor
+    asyncio.create_task(manage_fixed_rr(context.application, sig, trade))
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not active_trades:
