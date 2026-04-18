@@ -545,9 +545,48 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
+# ─── HORARIO OPERATIVO ───────────────────────────────────────────────────────
+# ARG = UTC − 3
+# No abrir nuevas posiciones después de 20:00 ARG = 23:00 UTC
+# Cerrar todo a 00:00 ARG = 03:00 UTC
+
+def is_entry_allowed() -> bool:
+    """Permite nuevas entradas solo hasta las 23:00 UTC (20:00 ARG)."""
+    h = datetime.now(timezone.utc).hour
+    return h < 23  # 23:00 UTC en adelante → no nuevas entradas
+
+def is_daily_close_time() -> bool:
+    """Cierre diario a las 03:00 UTC (00:00 ARG)."""
+    now = datetime.now(timezone.utc)
+    return now.hour == 3 and now.minute < 15  # ventana de 15 min para asegurar ejecución
+
 # ─── SCAN JOB ────────────────────────────────────────────────────────────────
 async def scan_job(app):
-    log.info("Running scan...")
+    now_utc = datetime.now(timezone.utc)
+    log.info(f"Running scan... UTC {now_utc.strftime('%H:%M')}")
+
+    # Cierre diario a las 03:00 UTC
+    if is_daily_close_time() and active_trades:
+        log.info("Cierre diario 03:00 UTC — cerrando posiciones abiertas")
+        for sym, t in list(active_trades.items()):
+            close_position(sym, t['qty'], t['dir'])
+            active_trades.pop(sym, None)
+        pending_signals.clear()
+        try:
+            await app.bot.send_message(
+                chat_id    = TELEGRAM_CHAT_ID,
+                text       = "🔄 *Cierre diario 00:00 ARG*\n\nTodas las posiciones cerradas. El bot arranca limpio.",
+                parse_mode = 'Markdown'
+            )
+        except:
+            pass
+        return
+
+    # No abrir nuevas posiciones después de 23:00 UTC (20:00 ARG)
+    if not is_entry_allowed():
+        log.info("Fuera de horario operativo (después de 20:00 ARG) — sin nuevas entradas")
+        return
+
     signals = scan_for_signals(SYMBOL)
 
     for sig in signals:
