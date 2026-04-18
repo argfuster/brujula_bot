@@ -13,7 +13,6 @@ import requests
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from binance.client import Client
 from binance.enums import *
 
@@ -274,8 +273,13 @@ def format_trade_update(sig: dict, event: str, price: float = 0, rr: float = 0) 
     return ''
 
 # ─── BINANCE EXECUTION ───────────────────────────────────────────────────────
+TESTNET = os.environ.get('TESTNET', 'true').lower() == 'true'
+
 def get_binance_client() -> Client:
-    return Client(BINANCE_API_KEY, BINANCE_SECRET)
+    client = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=TESTNET)
+    if TESTNET:
+        client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
+    return client
 
 def calc_qty(symbol: str, entry: float, risk_usdt: float, stop: float) -> float:
     risk_per_unit = abs(entry - stop)
@@ -566,31 +570,33 @@ async def scan_job(app):
             pass
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
+async def scan_callback(context):
+    """JobQueue callback — runs in the correct event loop."""
+    await scan_job(context.application)
+
+async def post_init(app):
+    app.job_queue.run_repeating(
+        callback = scan_callback,
+        interval = 900,
+        first    = 15,
+        name     = 'scan',
+    )
+    log.info(f"Bot started — monitoring {SYMBOL} | Risk: ${RISK_USDT} | Leverage: {LEVERAGE}x")
+
 def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise ValueError("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are required")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (Application.builder()
+           .token(TELEGRAM_TOKEN)
+           .post_init(post_init)
+           .build())
 
-    # Handlers
     app.add_handler(CommandHandler('status', cmd_status))
     app.add_handler(CommandHandler('close',  cmd_close))
     app.add_handler(CommandHandler('help',   cmd_help))
     app.add_handler(CallbackQueryHandler(handle_confirmation))
-
-    # Scheduler — scan every 15 minutes
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        lambda: asyncio.ensure_future(scan_job(app)),
-        trigger   = 'cron',
-        minute    = '0,15,30,45',
-        id        = 'scan',
-        misfire_grace_time = 60,
-    )
-    scheduler.start()
-
-    log.info(f"Bot started — monitoring {SYMBOL} | Risk: ${RISK_USDT} | Leverage: {LEVERAGE}x")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
