@@ -282,7 +282,6 @@ def get_binance_client() -> Client:
     return client
 
 def calc_qty(symbol: str, entry: float, risk_usdt: float, stop: float) -> float:
-def calc_qty(symbol: str, entry: float, risk_usdt: float, stop: float) -> float:
     """
     Calcula el tamaño de posición basado en el riesgo.
     qty = RISK_USDT / risk_per_unit
