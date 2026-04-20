@@ -317,6 +317,23 @@ def execute_entry(sig: dict) -> dict | None:
         margen   = nocional / LEVERAGE
         account  = client.futures_account()
         available = float(account.get('availableBalance', 0))
+
+        # Cap nocional at 50% of available balance × leverage
+        max_nocional = available * LEVERAGE * 0.5
+        if nocional > max_nocional:
+            qty      = max_nocional / sig['entry']
+            # Round to step size
+            info     = client.futures_exchange_info()
+            for s in info['symbols']:
+                if s['symbol'] == sig['symbol']:
+                    for f in s['filters']:
+                        if f['filterType'] == 'LOT_SIZE':
+                            step = float(f['stepSize'])
+                            qty  = round(qty - (qty % step), 8)
+            nocional = qty * sig['entry']
+            margen   = nocional / LEVERAGE
+            log.warning(f"Qty capped to avoid overexposure: {qty} BTC")
+
         if available < margen:
             log.error(f"Insufficient margin: need ${margen:.2f}, have ${available:.2f}")
             return None
@@ -332,18 +349,36 @@ def execute_entry(sig: dict) -> dict | None:
             quantity  = qty,
         )
 
-        # Place stop loss
-        sl_side = SIDE_SELL if sig['dir'] == 'long' else SIDE_BUY
-        client.futures_create_order(
-            symbol        = sig['symbol'],
-            side          = sl_side,
-            type          = 'STOP_MARKET',
-            stopPrice     = sig['stop'],
-            quantity      = qty,
-            reduceOnly    = True,
-        )
-
         fill_price = float(order.get('avgPrice', sig['entry']) or sig['entry'])
+
+        # Place stop loss — use STOP_MARKET with timeInForce GTE for compatibility
+        sl_side = SIDE_SELL if sig['dir'] == 'long' else SIDE_BUY
+        try:
+            client.futures_create_order(
+                symbol        = sig['symbol'],
+                side          = sl_side,
+                type          = 'STOP_MARKET',
+                stopPrice     = round(sig['stop'], 2),
+                quantity      = qty,
+                reduceOnly    = True,
+                timeInForce   = 'GTE_GTC',
+            )
+        except Exception as sl_err:
+            log.warning(f"STOP_MARKET failed ({sl_err}), trying STOP...")
+            try:
+                client.futures_create_order(
+                    symbol        = sig['symbol'],
+                    side          = sl_side,
+                    type          = 'STOP',
+                    price         = round(sig['stop'] * (0.999 if sig['dir'] == 'long' else 1.001), 2),
+                    stopPrice     = round(sig['stop'], 2),
+                    quantity      = qty,
+                    reduceOnly    = True,
+                    timeInForce   = 'GTC',
+                )
+            except Exception as sl_err2:
+                log.error(f"Stop order failed: {sl_err2} — monitor will handle stop")
+
         log.info(f"Order executed: {sig['dir']} {qty} {sig['symbol']} @ {fill_price}")
         return {'order': order, 'qty': qty, 'fill_price': fill_price}
 
