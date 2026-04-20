@@ -88,24 +88,32 @@ def detect_stop_hunt(df15: pd.DataFrame, ema15: pd.Series, atr15: pd.Series, i: 
     return None
 
 def detect_brt(df15: pd.DataFrame, ema15: pd.Series, i: int) -> dict | None:
-    if i < 20: return None
+    if i < 25: return None
     cur  = df15.iloc[i]
     emaV = ema15.iloc[i]
     if pd.isna(emaV): return None
 
-    win    = df15.iloc[i-20:i]
+    # Level from 20 candles back (excluding last 3)
+    win    = df15.iloc[i-20:i-3]
+    recent = df15.iloc[i-3:i]
     r_high = win['high'].max()
     r_low  = win['low'].min()
 
     if cur['close'] > emaV:
-        near = abs(cur['close'] - r_high) / r_high < 0.004
-        bull = cur['close'] > cur['open']
-        if near and bull:
+        # Bullish BRT: must have broken above level recently, then retested
+        broke_above = recent['high'].max() > r_high * 1.002
+        retesting   = abs(cur['close'] - r_high) / r_high < 0.004
+        bull_close  = cur['close'] > cur['open']
+        came_back   = cur['low'] < r_high * 1.003 and cur['close'] > r_high * 0.997
+        if broke_above and retesting and bull_close and came_back:
             return {'type': 'BRT', 'dir': 'long', 'level': r_high, 'atr': None}
     else:
-        near = abs(cur['close'] - r_low) / r_low < 0.004
-        bear = cur['close'] < cur['open']
-        if near and bear:
+        # Bearish BRT: must have broken below level recently, then retested
+        broke_below = recent['low'].min() < r_low * 0.998
+        retesting   = abs(cur['close'] - r_low) / r_low < 0.004
+        bear_close  = cur['close'] < cur['open']
+        came_back   = cur['high'] > r_low * 0.997 and cur['close'] < r_low * 1.003
+        if broke_below and retesting and bear_close and came_back:
             return {'type': 'BRT', 'dir': 'short', 'level': r_low, 'atr': None}
     return None
 
