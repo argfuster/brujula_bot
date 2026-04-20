@@ -155,7 +155,7 @@ def check_5m_momentum(df5: pd.DataFrame, target_time, direction: str) -> bool:
     return mom > 0 if direction == 'long' else mom < 0
 
 def is_weekend(dt) -> bool:
-    return dt.weekday() >= 5  # 5=Sat, 6=Sun
+    return dt.weekday() >= 5  # 5=Sat, 6=Sun UTC
 
 # ─── MAIN SCAN ───────────────────────────────────────────────────────────────
 def scan_for_signals(symbol: str) -> list[dict]:
@@ -187,21 +187,33 @@ def scan_for_signals(symbol: str) -> list[dict]:
         if pd.isna(ema1h_val): return []
         price = df15.iloc[i]['close']
         gap   = abs(price - ema1h_val) / ema1h_val
-        if gap < 0.002: return []  # no clear bias (chop zone)
+        log.info(f"SCAN | candle={candle_time} price={price:.2f} ema1h={ema1h_val:.2f} gap={gap:.4f}")
+        if gap < 0.002:
+            log.info(f"SCAN | SKIP chop gap={gap:.4f}")
+            return []
 
         # Layer 2: setup detection
         sig = None
         sig = sig or detect_stop_hunt(df15, ema15, atr15, i)
         sig = sig or detect_brt(df15, ema15, i)
         sig = sig or detect_squeeze(df15, ema15, atr15, i)
-        if not sig: return []
+        if not sig:
+            log.info(f"SCAN | SKIP no setup detected")
+            return []
+        log.info(f"SCAN | Setup detected: {sig['type']} {sig['dir']}")
 
         # Direction must align with 1h bias
-        if sig['dir'] == 'long'  and price < ema1h_val * 0.997: return []
-        if sig['dir'] == 'short' and price > ema1h_val * 1.003: return []
+        if sig['dir'] == 'long'  and price < ema1h_val * 0.997:
+            log.info(f"SCAN | SKIP bias fail long price={price:.2f} < ema={ema1h_val:.2f}*0.997")
+            return []
+        if sig['dir'] == 'short' and price > ema1h_val * 1.003:
+            log.info(f"SCAN | SKIP bias fail short")
+            return []
 
         # Layer 3: 5m momentum
-        if not check_5m_momentum(df5, candle_time, sig['dir']): return []
+        if not check_5m_momentum(df5, candle_time, sig['dir']):
+            log.info(f"SCAN | SKIP no 5m momentum")
+            return []
 
         # Build signal
         atr_val = sig.get('atr') or atr15.iloc[i]
