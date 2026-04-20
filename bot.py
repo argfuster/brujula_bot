@@ -68,9 +68,8 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 def detect_stop_hunt(df15: pd.DataFrame, ema15: pd.Series, atr15: pd.Series, i: int) -> dict | None:
     if i < 12: return None
     cur  = df15.iloc[i]
-    emaV = ema15.iloc[i]
     atrV = atr15.iloc[i]
-    if pd.isna(emaV) or pd.isna(atrV): return None
+    if pd.isna(atrV): return None
 
     win     = df15.iloc[i-10:i]
     r_low   = win['low'].min()
@@ -78,8 +77,9 @@ def detect_stop_hunt(df15: pd.DataFrame, ema15: pd.Series, atr15: pd.Series, i: 
     r_size  = r_high - r_low
     if r_size < atrV * 0.4: return None
 
-    bull = cur['low'] < r_low and cur['close'] > r_low * 1.001 and cur['close'] > emaV * 0.998
-    bear = cur['high'] > r_high and cur['close'] < r_high * 0.999 and cur['close'] < emaV * 1.002
+    # Sesgo ya verificado en scan_for_signals con EMA 1h
+    bull = cur['low'] < r_low and cur['close'] > r_low * 1.001
+    bear = cur['high'] > r_high and cur['close'] < r_high * 0.999
 
     if bull and (r_low - cur['low']) > atrV * 0.25:
         return {'type': 'SH', 'dir': 'long',  'level': r_low,  'atr': atrV}
