@@ -187,40 +187,51 @@ def scan_for_signals(symbol: str) -> list[dict]:
         if pd.isna(ema1h_val): return []
         price = df15.iloc[i]['close']
         gap   = abs(price - ema1h_val) / ema1h_val
-        log.info(f"SCAN | candle={candle_time} price={price:.2f} ema1h={ema1h_val:.2f} gap={gap:.4f}")
-        if gap < 0.002:
-            log.info(f"SCAN | SKIP chop gap={gap:.4f}")
-            return []
+        if gap < 0.002: return []
 
         # Layer 2: setup detection
         sig = None
         sig = sig or detect_stop_hunt(df15, ema15, atr15, i)
         sig = sig or detect_brt(df15, ema15, i)
         sig = sig or detect_squeeze(df15, ema15, atr15, i)
-        if not sig:
-            log.info(f"SCAN | SKIP no setup detected")
-            return []
-        log.info(f"SCAN | Setup detected: {sig['type']} {sig['dir']}")
+        if not sig: return []
 
         # Direction must align with 1h bias
-        if sig['dir'] == 'long'  and price < ema1h_val * 0.997:
-            log.info(f"SCAN | SKIP bias fail long price={price:.2f} < ema={ema1h_val:.2f}*0.997")
-            return []
-        if sig['dir'] == 'short' and price > ema1h_val * 1.003:
-            log.info(f"SCAN | SKIP bias fail short")
-            return []
+        if sig['dir'] == 'long'  and price < ema1h_val * 0.997: return []
+        if sig['dir'] == 'short' and price > ema1h_val * 1.003: return []
 
         # Layer 3: 5m momentum
-        if not check_5m_momentum(df5, candle_time, sig['dir']):
-            log.info(f"SCAN | SKIP no 5m momentum")
-            return []
+        if not check_5m_momentum(df5, candle_time, sig['dir']): return []
 
         # Build signal
         atr_val = sig.get('atr') or atr15.iloc[i]
-        risk    = atr_val * 1.5
-        entry   = price
-        stop    = entry - risk if sig['dir'] == 'long' else entry + risk
-        target  = entry + risk * RR_TARGET if sig['dir'] == 'long' else entry - risk * RR_TARGET
+
+        # Fetch current market price for entry
+        try:
+            ticker      = get_binance_client().futures_symbol_ticker(symbol=symbol)
+            entry       = float(ticker['price'])
+        except:
+            entry = price  # fallback to 15m close
+
+        # Stop = setup level (rLow for SH, BRT level) — fixed regardless of entry
+        level = sig.get('level')
+        if level:
+            stop = level if sig['dir'] == 'long' else level
+        else:
+            stop = entry - atr_val * 1.5 if sig['dir'] == 'long' else entry + atr_val * 1.5
+
+        risk   = abs(entry - stop)
+        if risk < atr_val * 0.1: risk = atr_val * 1.5  # fallback if entry too close to stop
+        target = entry + risk * RR_TARGET if sig['dir'] == 'long' else entry - risk * RR_TARGET
+
+        # Skip if RR is degraded (price moved too far from setup)
+        max_entry_drift = atr_val * 0.5  # max 0.5 ATR drift from 15m close
+        if sig['dir'] == 'long'  and entry > price + max_entry_drift:
+            log.info(f"Signal skipped — price drifted too far from setup: entry={entry:.2f} close={price:.2f}")
+            return []
+        if sig['dir'] == 'short' and entry < price - max_entry_drift:
+            log.info(f"Signal skipped — price drifted too far from setup: entry={entry:.2f} close={price:.2f}")
+            return []
 
         signal = {
             'id':        f"{symbol}_{sig['type']}_{int(candle_time.timestamp())}",
@@ -253,14 +264,16 @@ def format_signal_message(sig: dict) -> str:
     pct_stop = abs(sig['entry'] - sig['stop']) / sig['entry'] * 100
     pct_tgt  = abs(sig['entry'] - sig['target']) / sig['entry'] * 100
     bias_dir = 'sobre' if sig['dir'] == 'long' else 'bajo'
+    rr_real  = abs(sig['target'] - sig['entry']) / abs(sig['entry'] - sig['stop'])
 
     return (
         f"{emoji} *SEÑAL DETECTADA — {sig['symbol']}*\n\n"
         f"Setup:      `{TYPE_LABEL[sig['type']]}`\n"
         f"Dirección:  {DIR_EMOJI[sig['dir']]}\n"
-        f"Entrada:    `{sig['entry']:,.2f}`\n"
+        f"Entrada:    `{sig['entry']:,.2f}`  _(precio actual)_\n"
         f"Stop:       `{sig['stop']:,.2f}`  _(−{pct_stop:.2f}%)_\n"
-        f"Target 2R:  `{sig['target']:,.2f}`  _(+{pct_tgt:.2f}%)_\n\n"
+        f"Target 2R:  `{sig['target']:,.2f}`  _(+{pct_tgt:.2f}%)_\n"
+        f"R:R real:   `{rr_real:.2f}R`\n\n"
         f"Sesgo 1h:   ✓ precio {bias_dir} EMA 200 ({sig['ema1h']:,.2f})\n\n"
         f"_Revisá orderflow en Exocharts antes de confirmar._\n"
         f"_Delta y CVD en tu dirección? Absorción en el nivel?_\n\n"
