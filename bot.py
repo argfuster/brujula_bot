@@ -14,8 +14,8 @@ import pandas as pd
 import numpy as np
 import requests
 
-from telegram import Bot
-from telegram.ext import Application, CommandHandler, ContextTypes, Update
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from binance.client import Client
 from binance.enums import *
 
