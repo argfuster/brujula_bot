@@ -1,5 +1,5 @@
-python-telegram-bot[job-queue]==20.7
+python-telegram-bot[job-queue]==21.3
 python-binance==1.0.19
-pandas==2.1.4
+pandas==2.2.2
 numpy==1.26.4
 requests==2.31.0
