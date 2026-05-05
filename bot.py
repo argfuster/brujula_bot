@@ -73,6 +73,7 @@ RSI_PERIOD    = 14
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 active_trade: dict | None = None
+last_candle_time: int | None = None  # open_time de la última vela evaluada
 
 # ─── CLIENTE BINANCE ──────────────────────────────────────────────────────────
 def get_client() -> Client:
@@ -180,8 +181,13 @@ def check_signal(df: pd.DataFrame) -> str | None:
         return None
 
     # Alineación de EMAs
-    long_stack  = close > ef > em > es
-    short_stack = close < ef < em < es
+    # Si EMA_SLOW=0 en Railway, ignora la EMA lenta — señal solo por rápida y media
+    if EMA_SLOW > 0:
+        long_stack  = close > ef > em > es
+        short_stack = close < ef < em < es
+    else:
+        long_stack  = close > ef > em
+        short_stack = close < ef < em
 
     # Filtro RSI
     if long_stack  and rsi_val < RSI_MIN:
@@ -444,7 +450,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── SCAN ─────────────────────────────────────────────────────────────────────
 async def scan_job(app: Application) -> None:
-    global active_trade
+    global active_trade, last_candle_time
     log.info("Running scan...")
 
     try:
@@ -453,6 +459,13 @@ async def scan_job(app: Application) -> None:
     except Exception as e:
         log.error(f"Error obteniendo datos: {e}")
         return
+
+    # ── Deduplicación por vela: una señal máximo por vela de 5m ──
+    current_candle = int(df['open_time'].iloc[-2])
+    if current_candle == last_candle_time:
+        log.info(f"Vela ya evaluada ({current_candle}) — esperando nueva vela")
+        return
+    last_candle_time = current_candle
 
     # ── Gestión de posición abierta ──
     if active_trade:
