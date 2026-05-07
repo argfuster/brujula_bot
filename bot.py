@@ -1,44 +1,26 @@
 """
-Brújula Trading Bot — EMA Stack
-================================
-Full automático: EMA15/60/200 + ADX + ATR + RSI + Volumen en 5m
-Horario: NY (13:30-20:00 UTC) + Asia (00:00-08:00 UTC) + Fin de semana
-Notifica por Telegram al abrir/cerrar — sin pedir confirmación
-Sizing: usa balance completo × leverage (capitalización real)
+Brújula Trading Bot — EMA + ADX + ATR + Trailing Swing
+=======================================================
+Variables Railway:
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BINANCE_API_KEY, BINANCE_API_SECRET
+  USE_TESTNET (true), TRADING_SYMBOL (ETHUSDT), LEVERAGE (2), CAPITAL_PCT (95)
+  EMA_PERIOD (25), ADX_PERIOD (14), ADX_MIN (25)
+  ATR_PERIOD (14), ATR_MIN_PCT (0.25)
+  SL_PCT (0.5), TRAIL_PCT (50), SCAN_INTERVAL (60)
 
-Variables de entorno en Railway:
-  TELEGRAM_BOT_TOKEN   (requerida)
-  TELEGRAM_CHAT_ID     (requerida)
-  BINANCE_API_KEY      (requerida)
-  BINANCE_API_SECRET   (requerida)
-  USE_TESTNET          → true / false   (default: true)
-  TRADING_SYMBOL       → ETHUSDT        (default: ETHUSDT)
-  LEVERAGE             → 2              (default: 2)
-  EMA_FAST             → 15             (default: 15)
-  EMA_MID              → 60             (default: 60)
-  EMA_SLOW             → 200            (default: 200)
-  ADX_MIN              → 30             (default: 30)
-  ATR_MIN_PCT          → 0.2            (default: 0.2)
-  RSI_LONG_MIN         → 55             (default: 55)
-  RSI_SHORT_MAX        → 45             (default: 45)
-  VOL_PERIOD           → 50             (default: 50)
-  VOL_MULT             → 1.5            (default: 1.5)
-  SCAN_INTERVAL        → 60             (default: 60)
+Sesiones: NY · Londres · Pre-NY · Asia · Fin de semana (sin Post-NY)
 """
 
 import os
-import asyncio
 import logging
 from datetime import datetime, timezone
 
-import pandas as pd
 import numpy as np
-import requests
-
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import pandas as pd
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ─── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -50,183 +32,65 @@ log = logging.getLogger(__name__)
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
-BINANCE_API_KEY  = os.environ.get('BINANCE_API_KEY', '')
+BINANCE_KEY      = os.environ.get('BINANCE_API_KEY', '')
 BINANCE_SECRET   = os.environ.get('BINANCE_API_SECRET', '')
 USE_TESTNET      = os.environ.get('USE_TESTNET', 'true').lower() == 'true'
-
-SYMBOL        = os.environ.get('TRADING_SYMBOL', 'ETHUSDT')
-LEVERAGE      = int(os.environ.get('LEVERAGE', '2'))
-EMA_FAST      = int(os.environ.get('EMA_FAST', '15'))
-EMA_MID       = int(os.environ.get('EMA_MID', '60'))
-EMA_SLOW      = int(os.environ.get('EMA_SLOW', '200'))
-ADX_MIN       = float(os.environ.get('ADX_MIN', '30'))
-ATR_MIN_PCT   = float(os.environ.get('ATR_MIN_PCT', '0.2'))
-RSI_MIN       = float(os.environ.get('RSI_LONG_MIN', '55'))
-RSI_MAX       = float(os.environ.get('RSI_SHORT_MAX', '45'))
-VOL_PERIOD    = int(os.environ.get('VOL_PERIOD', '50'))
-VOL_MULT      = float(os.environ.get('VOL_MULT', '1.5'))
-SCAN_INTERVAL = int(os.environ.get('SCAN_INTERVAL', '60'))
-
-ATR_PERIOD    = 14
-ADX_PERIOD    = 14
-RSI_PERIOD    = 14
+SYMBOL           = os.environ.get('TRADING_SYMBOL', 'ETHUSDT')
+LEVERAGE         = int(os.environ.get('LEVERAGE', '2'))
+CAPITAL_PCT      = float(os.environ.get('CAPITAL_PCT', '95'))
+EMA_PERIOD       = int(os.environ.get('EMA_PERIOD', '25'))
+ADX_PERIOD       = int(os.environ.get('ADX_PERIOD', '14'))
+ADX_MIN          = float(os.environ.get('ADX_MIN', '25'))
+ATR_PERIOD       = int(os.environ.get('ATR_PERIOD', '14'))
+ATR_MIN_PCT      = float(os.environ.get('ATR_MIN_PCT', '0.25'))
+SL_PCT           = float(os.environ.get('SL_PCT', '0.5'))
+TRAIL_PCT        = float(os.environ.get('TRAIL_PCT', '50'))
+SCAN_INTERVAL    = int(os.environ.get('SCAN_INTERVAL', '60'))
+TF               = '15m'
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 active_trade: dict | None = None
-last_candle_time: int | None = None  # open_time de la última vela evaluada
+pending_signal: str | None = None
+last_candle_time: int | None = None
 
 # ─── CLIENTE BINANCE ──────────────────────────────────────────────────────────
 def get_client() -> Client:
-    c = Client(BINANCE_API_KEY, BINANCE_SECRET, testnet=USE_TESTNET)
+    c = Client(BINANCE_KEY, BINANCE_SECRET, testnet=USE_TESTNET)
     if USE_TESTNET:
         c.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
     return c
 
-def get_price(symbol: str) -> float:
-    """Precio mark del símbolo. Retorna 0.0 si falla."""
+def get_mark_price(symbol: str) -> float:
     try:
-        c = get_client()
-        data = c.futures_mark_price(symbol=symbol)
-        price = float(data.get('markPrice', 0))
-        return price
+        data = get_client().futures_mark_price(symbol=symbol)
+        return float(data.get('markPrice', 0))
     except Exception as e:
-        log.error(f"Error obteniendo precio {symbol}: {e}")
+        log.error(f"Error mark price: {e}")
         return 0.0
 
-def get_klines(symbol: str, interval: str = '5m', limit: int = 300) -> pd.DataFrame:
-    """Descarga velas y retorna DataFrame con columnas OHLCV."""
-    c = get_client()
-    raw = c.futures_klines(symbol=symbol, interval=interval, limit=limit)
+def get_klines(symbol: str, limit: int = 350) -> pd.DataFrame:
+    raw = get_client().futures_klines(symbol=symbol, interval=TF, limit=limit)
     df = pd.DataFrame(raw, columns=[
-        'open_time', 'open', 'high', 'low', 'close', 'vol',
-        'close_time', 'quote_vol', 'trades', 'taker_buy_base',
-        'taker_buy_quote', 'ignore'
+        'open_time','open','high','low','close','vol',
+        'close_time','qvol','trades','tbb','tbq','ignore'
     ])
-    for col in ['open', 'high', 'low', 'close', 'vol']:
+    for col in ['open','high','low','close','vol']:
         df[col] = pd.to_numeric(df[col])
+    df['open_time'] = df['open_time'].astype(int)
     return df
 
-# ─── INDICADORES ──────────────────────────────────────────────────────────────
-def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
-    hl = df['high'] - df['low']
-    hc = (df['high'] - df['close'].shift(1)).abs()
-    lc = (df['low']  - df['close'].shift(1)).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.ewm(span=period, adjust=False).mean()
-
-def calc_rsi(series: pd.Series, period: int) -> pd.Series:
-    delta = series.diff()
-    gain  = delta.clip(lower=0).ewm(span=period, adjust=False).mean()
-    loss  = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def calc_adx(df: pd.DataFrame, period: int) -> pd.Series:
-    up   = df['high'].diff()
-    down = -df['low'].diff()
-    plus_dm  = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    tr = calc_atr(df, period)
-    tr_smooth   = pd.Series(plus_dm).ewm(span=period, adjust=False).mean()
-    plus_di     = 100 * pd.Series(plus_dm).ewm(span=period, adjust=False).mean() / tr
-    minus_di    = 100 * pd.Series(minus_dm).ewm(span=period, adjust=False).mean() / tr
-    dx          = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan))
-    adx         = dx.ewm(span=period, adjust=False).mean()
-    adx.index   = df.index
-    return adx
-
-# ─── SEÑAL ────────────────────────────────────────────────────────────────────
-def check_signal(df: pd.DataFrame) -> str | None:
-    """
-    Retorna 'long', 'short' o None.
-    Usa la vela cerrada anterior (iloc[-2]) para evitar señales de vela en formación.
-    """
-    limit_needed = max(EMA_SLOW, VOL_PERIOD, ADX_PERIOD * 2) + 10
-    if len(df) < limit_needed:
-        return None
-
-    ema_fast = calc_ema(df['close'], EMA_FAST)
-    ema_mid  = calc_ema(df['close'], EMA_MID)
-    ema_slow = calc_ema(df['close'], EMA_SLOW)
-    atr      = calc_atr(df, ATR_PERIOD)
-    adx      = calc_adx(df, ADX_PERIOD)
-    rsi      = calc_rsi(df['close'], RSI_PERIOD)
-
-    i = -2  # última vela cerrada
-    close   = df['close'].iloc[i]
-    ef      = ema_fast.iloc[i]
-    em      = ema_mid.iloc[i]
-    es      = ema_slow.iloc[i]
-    atr_val = atr.iloc[i]
-    adx_val = adx.iloc[i]
-    rsi_val = rsi.iloc[i]
-
-    if any(pd.isna(x) for x in [ef, em, es, atr_val, adx_val, rsi_val]):
-        return None
-
-    # Filtro ADX
-    if adx_val < ADX_MIN:
-        return None
-
-    # Filtro ATR%
-    if close > 0 and (atr_val / close * 100) < ATR_MIN_PCT:
-        return None
-
-    # Filtro volumen
-    avg_vol = df['vol'].iloc[i - VOL_PERIOD:i].mean()
-    if avg_vol > 0 and df['vol'].iloc[i] < avg_vol * VOL_MULT:
-        return None
-
-    # Alineación de EMAs
-    # Si EMA_SLOW=0 en Railway, ignora la EMA lenta — señal solo por rápida y media
-    if EMA_SLOW > 0:
-        long_stack  = close > ef > em > es
-        short_stack = close < ef < em < es
-    else:
-        long_stack  = close > ef > em
-        short_stack = close < ef < em
-
-    # Filtro RSI
-    if long_stack  and rsi_val < RSI_MIN:
-        return None
-    if short_stack and rsi_val > RSI_MAX:
-        return None
-
-    if long_stack:
-        return 'long'
-    if short_stack:
-        return 'short'
-    return None
-
-def check_exit(df: pd.DataFrame, direction: str) -> bool:
-    """Sale cuando el precio cruza la EMA media."""
-    ema_mid = calc_ema(df['close'], EMA_MID)
-    close   = df['close'].iloc[-2]
-    em      = ema_mid.iloc[-2]
-    if pd.isna(em):
-        return False
-    if direction == 'long'  and close < em:
-        return True
-    if direction == 'short' and close > em:
-        return True
-    return False
-
-# ─── SIZING ───────────────────────────────────────────────────────────────────
-def get_balance(client: Client) -> float:
+def get_balance() -> float:
     try:
-        for b in client.futures_account_balance():
+        for b in get_client().futures_account_balance():
             if b['asset'] == 'USDT':
                 return float(b['balance'])
     except Exception as e:
         log.error(f"Error balance: {e}")
     return 0.0
 
-def get_step(client: Client, symbol: str) -> float:
+def get_step_size(symbol: str) -> float:
     try:
-        info = client.futures_exchange_info()
+        info = get_client().futures_exchange_info()
         for s in info['symbols']:
             if s['symbol'] == symbol:
                 for f in s['filters']:
@@ -236,282 +100,375 @@ def get_step(client: Client, symbol: str) -> float:
         log.error(f"Error step size: {e}")
     return 0.001
 
-def calc_qty(balance: float, price: float, step: float) -> float:
-    if price <= 0 or step <= 0:
-        return 0.0
-    notional = balance * LEVERAGE * 0.95  # 95% para dejar margen
-    qty = notional / price
-    qty = qty - (qty % step)
-    return round(qty, 8)
+# ─── INDICADORES ──────────────────────────────────────────────────────────────
+def calc_ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    hl  = df['high'] - df['low']
+    hc  = (df['high'] - df['close'].shift(1)).abs()
+    lc  = (df['low']  - df['close'].shift(1)).abs()
+    tr  = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+    return tr.ewm(span=period, adjust=False).mean()
+
+def calc_adx(df: pd.DataFrame, period: int) -> pd.Series:
+    up   = df['high'].diff()
+    down = -df['low'].diff()
+    pdm  = np.where((up > down) & (up > 0), up, 0.0)
+    ndm  = np.where((down > up) & (down > 0), down, 0.0)
+    atr  = calc_atr(df, period)
+    pdi  = 100 * pd.Series(pdm, index=df.index).ewm(span=period, adjust=False).mean() / atr
+    ndi  = 100 * pd.Series(ndm, index=df.index).ewm(span=period, adjust=False).mean() / atr
+    dx   = (100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan))
+    return dx.ewm(span=period, adjust=False).mean()
+
+# ─── HORARIO ──────────────────────────────────────────────────────────────────
+def in_session(ts_sec: int) -> bool:
+    d   = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
+    hm  = d.hour * 60 + d.minute
+    dow = d.weekday()
+    if dow >= 5:                                    return True   # finde
+    if 13 * 60 + 30 <= hm < 20 * 60:               return True   # NY
+    if 8  * 60       <= hm < 12 * 60:               return True   # Londres
+    if 12 * 60       <= hm < 13 * 60 + 30:          return True   # Pre-NY
+    if hm < 8 * 60:                                 return True   # Asia
+    return False                                                  # Post-NY: OFF
+
+# ─── SEÑAL ────────────────────────────────────────────────────────────────────
+def check_signal(df: pd.DataFrame) -> str | None:
+    min_bars = max(EMA_PERIOD, ADX_PERIOD * 3, ATR_PERIOD) + 10
+    if len(df) < min_bars:
+        return None
+
+    ema = calc_ema(df['close'], EMA_PERIOD)
+    atr = calc_atr(df, ATR_PERIOD)
+    adx = calc_adx(df, ADX_PERIOD)
+
+    i     = -2
+    close = df['close'].iloc[i]
+    ema_v = ema.iloc[i]
+    atr_v = atr.iloc[i]
+    adx_v = adx.iloc[i]
+
+    if any(pd.isna(x) for x in [ema_v, atr_v, adx_v]) or close <= 0:
+        return None
+    if adx_v < ADX_MIN:
+        return None
+    if atr_v / close * 100 < ATR_MIN_PCT:
+        return None
+
+    if close > ema_v:   return 'long'
+    if close < ema_v:   return 'short'
+    return None
+
+# ─── GESTIÓN DE POSICIÓN ──────────────────────────────────────────────────────
+def check_exit(df: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
+    ema   = calc_ema(df['close'], EMA_PERIOD)
+    i     = -2
+    close = df['close'].iloc[i]
+    ema_v = ema.iloc[i]
+    prev_close = df['close'].iloc[i - 1]
+
+    direction  = trade['direction']
+    entry      = trade['entry']
+    sl_fixed   = trade['sl_fixed']
+
+    # Actualizar mejor cierre histórico (trailing real — nunca retrocede)
+    if direction == 'long' and prev_close > trade['best_swing']:
+        trade['best_swing'] = prev_close
+    elif direction == 'short' and prev_close < trade['best_swing']:
+        trade['best_swing'] = prev_close
+
+    best_swing = trade['best_swing']
+
+    # Calcular trailing
+    trail_stop = None
+    if direction == 'long':
+        swing = best_swing - entry
+        if swing > 0:
+            trail_stop = entry + swing * (TRAIL_PCT / 100)
+    else:
+        swing = entry - best_swing
+        if swing > 0:
+            trail_stop = entry - swing * (TRAIL_PCT / 100)
+
+    # Stop activo = mejor entre SL fijo y trailing
+    if direction == 'long':
+        active_stop = max(sl_fixed, trail_stop) if trail_stop else sl_fixed
+    else:
+        active_stop = min(sl_fixed, trail_stop) if trail_stop else sl_fixed
+
+    trade['trail_stop']  = trail_stop
+    trade['active_stop'] = active_stop
+
+    # Exit por stop (close de vela)
+    if direction == 'long' and close <= active_stop:
+        reason = 'trailing' if (trail_stop and trail_stop >= sl_fixed) else 'sl'
+        return True, reason, active_stop
+    if direction == 'short' and close >= active_stop:
+        reason = 'trailing' if (trail_stop and trail_stop <= sl_fixed) else 'sl'
+        return True, reason, active_stop
+
+    # Exit por cruce EMA
+    if direction == 'long'  and close < ema_v:  return True, 'ema', close
+    if direction == 'short' and close > ema_v:  return True, 'ema', close
+
+    return False, '', 0.0
 
 # ─── EJECUCIÓN ────────────────────────────────────────────────────────────────
-def open_position(client: Client, symbol: str, direction: str) -> dict | None:
+def open_position(direction: str) -> dict | None:
     try:
-        client.futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
-        price   = get_price(symbol)
-        balance = get_balance(client)
-        step    = get_step(client, symbol)
-        qty     = calc_qty(balance, price, step)
+        client = get_client()
+        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        balance = get_balance()
+        price   = get_mark_price(SYMBOL)
+        step    = get_step_size(SYMBOL)
+
+        if price <= 0 or step <= 0 or balance <= 0:
+            log.error(f"Datos inválidos: price={price} step={step} balance={balance}")
+            return None
+
+        notional = balance * (CAPITAL_PCT / 100) * LEVERAGE
+        qty      = notional / price
+        qty      = qty - (qty % step)
+        qty      = round(qty, 8)
 
         if qty <= 0:
-            log.error(f"Qty=0 — balance: ${balance:.2f}, price: {price}")
+            log.error(f"Qty=0 — balance=${balance:.2f} price={price}")
             return None
 
         side  = SIDE_BUY if direction == 'long' else SIDE_SELL
         order = client.futures_create_order(
-            symbol=symbol, side=side,
+            symbol=SYMBOL, side=side,
             type=ORDER_TYPE_MARKET, quantity=qty
         )
-
-        # FIX: en testnet avgPrice puede venir como "0" — fallback al markPrice
         raw_fill = float(order.get('avgPrice') or 0)
-        fill = raw_fill if raw_fill > 0 else price
+        entry    = raw_fill if raw_fill > 0 else price
+        sl_fixed = entry * (1 - SL_PCT / 100) if direction == 'long' \
+                   else entry * (1 + SL_PCT / 100)
 
-        log.info(
-            f"Abierto: {direction.upper()} {qty} {symbol} @ {fill:.2f} "
-            f"| Balance: ${balance:.2f} | Lev: {LEVERAGE}×"
-        )
+        log.info(f"Abierto: {direction.upper()} {qty} {SYMBOL} @ {entry:.4f} SL={sl_fixed:.4f}")
         return {
-            'symbol':     symbol,
-            'direction':  direction,
-            'qty':        qty,
-            'entry':      fill,
-            'balance_in': balance,
-            'opened_at':  datetime.now(timezone.utc),
+            'symbol':      SYMBOL,
+            'direction':   direction,
+            'qty':         qty,
+            'entry':       entry,
+            'sl_fixed':    sl_fixed,
+            'best_swing':  entry,
+            'trail_stop':  None,
+            'active_stop': sl_fixed,
+            'balance_in':  balance,
+            'opened_at':   datetime.now(timezone.utc),
         }
-
     except Exception as e:
         log.error(f"Error abriendo posición: {e}")
         return None
 
-def close_position(client: Client, trade: dict) -> float | None:
+def close_position(trade: dict) -> float | None:
     try:
-        side  = SIDE_SELL if trade['direction'] == 'long' else SIDE_BUY
-        order = client.futures_create_order(
+        client = get_client()
+        side   = SIDE_SELL if trade['direction'] == 'long' else SIDE_BUY
+        order  = client.futures_create_order(
             symbol=trade['symbol'], side=side,
             type=ORDER_TYPE_MARKET,
             quantity=trade['qty'], reduceOnly=True
         )
-        raw_price = float(order.get('avgPrice') or 0)
-        price = raw_price if raw_price > 0 else get_price(trade['symbol'])
-        log.info(f"Cerrado: {trade['symbol']} @ {price:.2f}")
+        raw   = float(order.get('avgPrice') or 0)
+        price = raw if raw > 0 else get_mark_price(trade['symbol'])
+        log.info(f"Cerrado: {trade['symbol']} @ {price:.4f}")
         return price
     except Exception as e:
         log.error(f"Error cerrando: {e}")
         return None
 
-# ─── HORARIO ──────────────────────────────────────────────────────────────────
-def in_session(now: datetime) -> bool:
-    """True durante sesión NY, sesión Asia, o fin de semana."""
-    dow = now.weekday()   # 0=lun … 6=dom
-    h   = now.hour
-    m   = now.minute
-    hm  = h * 60 + m
-
-    # Fin de semana: operar siempre
-    if dow >= 5:
-        return True
-
-    # Sesión NY: 13:30 – 20:00 UTC
-    if 13 * 60 + 30 <= hm < 20 * 60:
-        return True
-
-    # Sesión Asia: 00:00 – 08:00 UTC
-    if 0 <= hm < 8 * 60:
-        return True
-
-    return False
-
-# ─── MENSAJES TELEGRAM ────────────────────────────────────────────────────────
-def format_open(trade: dict) -> str:
-    env = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
-    de  = '🟢 LONG' if trade['direction'] == 'long' else '🔴 SHORT'
+# ─── MENSAJES ─────────────────────────────────────────────────────────────────
+def fmt_open(trade: dict) -> str:
+    env   = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
+    emoji = '🟢' if trade['direction'] == 'long' else '🔴'
     return (
-        f"{'─'*28}\n⚡ *NUEVA POSICIÓN* {env}\n{'─'*28}\n"
+        f"{'─'*30}\n⚡ *ENTRADA* {env}\n{'─'*30}\n"
         f"*Par:*      `{trade['symbol']}`\n"
-        f"*Dir:*      {de}\n"
-        f"*Entrada:*  `{trade['entry']:,.2f} USDT`\n"
-        f"*Qty:*      `{trade['qty']}`\n"
-        f"*Capital:*  `${trade['balance_in']:,.2f}`\n"
-        f"*Leverage:* `{LEVERAGE}×`\n"
-        f"*Exit:*     Cruce EMA{EMA_MID}\n"
-        f"{'─'*28}"
+        f"*Dir:*      {emoji} {trade['direction'].upper()}\n"
+        f"*Precio:*   `{trade['entry']:,.4f}`\n"
+        f"*Cantidad:* `{trade['qty']}`\n"
+        f"*SL fijo:*  `{trade['sl_fixed']:,.4f}` (-{SL_PCT}%)\n"
+        f"*Trail:*    {TRAIL_PCT}% del swing\n"
+        f"*Capital:*  `${trade['balance_in']:,.2f}` × {LEVERAGE}×\n"
+        f"{'─'*30}"
     )
 
-def format_close(trade: dict, exit_price: float) -> str:
-    entry = trade.get('entry') or 0
-    if entry > 0 and exit_price > 0:
-        pnl = (exit_price - entry) / entry * 100
-        if trade['direction'] == 'short':
-            pnl = -pnl
-        pnl_usd = trade['balance_in'] * pnl / 100 * LEVERAGE
-        pnl_str = f"`{pnl:+.2f}%` (`{'+' if pnl_usd >= 0 else ''}{pnl_usd:.2f} USDT`)"
-        re = '✅ WIN' if pnl > 0 else '❌ LOSS'
-    else:
-        pnl_str = "_no disponible_"
-        re = '⚪ CERRADO'
-
-    dur = datetime.now(timezone.utc) - trade['opened_at']
-    h = int(dur.total_seconds() // 3600)
-    m = int((dur.total_seconds() % 3600) // 60)
-    de = '🟢 LONG' if trade['direction'] == 'long' else '🔴 SHORT'
+def fmt_close(trade: dict, exit_price: float, reason: str) -> str:
+    entry    = trade['entry']
+    dir_     = trade['direction']
+    pnl_pct  = (exit_price - entry) / entry * 100 if dir_ == 'long' \
+               else (entry - exit_price) / entry * 100
+    pnl_usdt = trade['balance_in'] * (CAPITAL_PCT / 100) * LEVERAGE * pnl_pct / 100
+    dur      = datetime.now(timezone.utc) - trade['opened_at']
+    h, m     = int(dur.total_seconds() // 3600), int((dur.total_seconds() % 3600) // 60)
+    emoji    = '🟢' if dir_ == 'long' else '🔴'
+    result   = '✅ WIN' if pnl_pct > 0 else '❌ LOSS'
+    reason_str = {'sl':'🛑 Stop Loss fijo','trailing':'📍 Trailing stop',
+                  'ema':'🟣 Cruce EMA','manual':'🖐 Cierre manual'}.get(reason, reason)
+    trail_str = f"`{trade['trail_stop']:,.4f}`" if trade.get('trail_stop') else '_no activo_'
     return (
-        f"{'─'*28}\n🔔 *POSICIÓN CERRADA*\n{'─'*28}\n"
-        f"*Resultado:* {re}\n"
-        f"*Par:*       `{trade['symbol']}`\n"
-        f"*Dir:*       {de}\n"
-        f"*Entrada:*   `{entry:,.2f}`\n"
-        f"*Salida:*    `{exit_price:,.2f}`\n"
-        f"*P/L:*       {pnl_str}\n"
-        f"*Duración:*  `{h}h {m}m`\n"
-        f"{'─'*28}"
+        f"{'─'*30}\n🔔 *SALIDA* — {result}\n{'─'*30}\n"
+        f"*{trade['symbol']}* {emoji} {dir_.upper()}\n"
+        f"*Motivo:*   {reason_str}\n"
+        f"*Entrada:*  `{entry:,.4f}`\n"
+        f"*Salida:*   `{exit_price:,.4f}`\n"
+        f"*SL fijo:*  `{trade['sl_fixed']:,.4f}`\n"
+        f"*Trail:*    {trail_str}\n"
+        f"*P/L:*      `{pnl_pct:+.3f}%` (`{'+' if pnl_usdt>=0 else ''}{pnl_usdt:.2f} USDT`)\n"
+        f"*Duración:* `{h}h {m}m`\n"
+        f"{'─'*30}"
     )
 
 async def send_tg(app: Application, text: str) -> None:
     try:
-        await app.bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='Markdown'
-        )
+        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='Markdown')
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
 # ─── COMANDOS ─────────────────────────────────────────────────────────────────
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    global active_trade
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    global active_trade, pending_signal
     if not active_trade:
-        await update.message.reply_text("📭 Sin posiciones abiertas.")
+        msg = "📭 *Sin posición abierta.*"
+        if pending_signal:
+            msg += f"\n⏳ Señal pendiente: {pending_signal.upper()} (entra en próxima vela)"
+        await update.message.reply_text(msg, parse_mode='Markdown')
         return
     try:
-        price = get_price(active_trade['symbol'])
-        entry = active_trade.get('entry') or 0
-
-        dur = datetime.now(timezone.utc) - active_trade['opened_at']
-        h   = int(dur.total_seconds() // 3600)
-        m   = int((dur.total_seconds() % 3600) // 60)
-        dir_e = '🟢 LONG' if active_trade['direction'] == 'long' else '🔴 SHORT'
-
-        # FIX: evitar division by zero si entry=0 o price=0
-        if entry > 0 and price > 0:
-            pnl = (price - entry) / entry * 100
-            if active_trade['direction'] == 'short':
-                pnl = -pnl
-            pnl_str = f"`{pnl:+.2f}%`"
-        else:
-            pnl_str = "_entrada sin confirmar_"
-
-        price_str = f"`{price:,.2f}`" if price > 0 else "_no disponible_"
-        entry_str = f"`{entry:,.2f}`" if entry > 0 else "_pendiente de fill_"
-
+        price  = get_mark_price(active_trade['symbol'])
+        entry  = active_trade['entry']
+        dir_   = active_trade['direction']
+        pnl    = (price - entry) / entry * 100 if dir_ == 'long' else (entry - price) / entry * 100
+        dur    = datetime.now(timezone.utc) - active_trade['opened_at']
+        h, m   = int(dur.total_seconds()//3600), int((dur.total_seconds()%3600)//60)
+        trail  = active_trade.get('trail_stop')
+        trail_str  = f"`{trail:,.4f}`" if trail else '_aún no activo_'
+        active_str = f"`{active_trade.get('active_stop', 0):,.4f}`"
+        emoji  = '🟢' if dir_ == 'long' else '🔴'
         msg = (
             f"📊 *Posición activa*\n\n"
-            f"*{active_trade['symbol']}* {dir_e}\n"
-            f"Entrada: {entry_str}\n"
-            f"Precio actual: {price_str}\n"
-            f"P/L: {pnl_str}\n"
-            f"Duración: `{h}h {m}m`"
+            f"*{active_trade['symbol']}* {emoji} {dir_.upper()}\n"
+            f"Entrada:     `{entry:,.4f}`\n"
+            f"Precio:      `{price:,.4f}`\n"
+            f"P/L:         `{pnl:+.3f}%`\n"
+            f"SL fijo:     `{active_trade['sl_fixed']:,.4f}`\n"
+            f"Trail stop:  {trail_str}\n"
+            f"Stop activo: {active_str}\n"
+            f"Mejor swing: `{active_trade['best_swing']:,.4f}`\n"
+            f"Duración:    `{h}h {m}m`"
         )
     except Exception as e:
-        log.error(f"Error en /status: {e}")
-        msg = f"⚠️ Error obteniendo status: {e}"
-
+        msg = f"⚠️ Error: {e}"
     await update.message.reply_text(msg, parse_mode='Markdown')
 
-async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global active_trade
     if not active_trade:
-        await update.message.reply_text("📭 Sin posiciones abiertas.")
+        await update.message.reply_text("📭 Sin posición abierta.")
         return
-    client = get_client()
-    exit_price = close_position(client, active_trade)
+    exit_price = close_position(active_trade)
     if exit_price:
-        msg = format_close(active_trade, exit_price) + "\n_Cierre manual por comando._"
+        msg = fmt_close(active_trade, exit_price, 'manual')
         active_trade = None
         await update.message.reply_text(msg, parse_mode='Markdown')
     else:
-        await update.message.reply_text("❌ Error cerrando posición — verificá en Binance.")
+        await update.message.reply_text("❌ Error cerrando — verificá en Binance.")
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     env = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
     msg = (
-        f"🤖 *Brújula EMA Stack Bot* {env}\n\n"
-        f"*Comandos:*\n"
-        f"/status — estado de la posición activa\n"
-        f"/close  — cerrar posición manualmente\n"
+        f"🤖 *Brújula EMA+ADX+ATR Bot* {env}\n\n"
+        f"/status — posición activa y stops\n"
+        f"/close  — cerrar manualmente\n"
         f"/help   — este mensaje\n\n"
-        f"*Config actual:*\n"
-        f"Par: `{SYMBOL}` | Leverage: `{LEVERAGE}×`\n"
-        f"EMAs: `{EMA_FAST}/{EMA_MID}/{EMA_SLOW}`\n"
-        f"ADX: `{ADX_MIN}` | ATR: `{ATR_MIN_PCT}%`\n"
-        f"RSI: `{RSI_MIN}/{RSI_MAX}` | Vol: `{VOL_MULT}×`\n"
-        f"Scan: cada `{SCAN_INTERVAL}s`\n"
-        f"Horario: NY + Asia + Fin de semana"
+        f"EMA `{EMA_PERIOD}` · ADX `{ADX_MIN}` · ATR `{ATR_MIN_PCT}%` · `{TF}`\n"
+        f"SL `{SL_PCT}%` + Trailing `{TRAIL_PCT}%` del swing\n"
+        f"`{SYMBOL}` · `{LEVERAGE}×` · Capital `{CAPITAL_PCT}%`\n"
+        f"Sesiones: NY · Londres · Pre-NY · Asia · Finde\n"
+        f"Scan cada `{SCAN_INTERVAL}s`"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 # ─── SCAN ─────────────────────────────────────────────────────────────────────
 async def scan_job(app: Application) -> None:
-    global active_trade, last_candle_time
-    log.info("Running scan...")
+    global active_trade, pending_signal, last_candle_time
 
     try:
-        client = get_client()
-        df     = get_klines(SYMBOL)
+        df = get_klines(SYMBOL, limit=350)
     except Exception as e:
-        log.error(f"Error obteniendo datos: {e}")
+        log.error(f"Error klines: {e}")
         return
 
-    # ── Deduplicación por vela: una señal máximo por vela de 5m ──
+    # Deduplicar por vela
     current_candle = int(df['open_time'].iloc[-2])
     if current_candle == last_candle_time:
-        log.info(f"Vela ya evaluada ({current_candle}) — esperando nueva vela")
+        log.info("Vela ya evaluada")
         return
     last_candle_time = current_candle
 
-    # ── Gestión de posición abierta ──
+    # ── GESTIÓN DE POSICIÓN ABIERTA ──────────────────────────────────────────
     if active_trade:
         try:
-            should_exit = check_exit(df, active_trade['direction'])
+            should_exit, reason, _ = check_exit(df, active_trade)
             if should_exit:
-                exit_price = close_position(client, active_trade)
+                exit_price = close_position(active_trade)
                 if exit_price:
-                    msg = format_close(active_trade, exit_price) + "\n_Cierre automático por EMA._"
-                    active_trade = None
+                    msg = fmt_close(active_trade, exit_price, reason)
+                    active_trade   = None
+                    pending_signal = None
                     await send_tg(app, msg)
-                    log.info("Posición cerrada por señal EMA")
+                    log.info(f"Cerrado — motivo: {reason}")
                 else:
-                    log.error("Fallo cierre — reintento próximo scan")
+                    log.error("Fallo en cierre")
+            else:
+                stop  = active_trade.get('active_stop', 0)
+                trail = active_trade.get('trail_stop')
+                log.info(
+                    f"Trade {active_trade['direction'].upper()} | "
+                    f"Stop={stop:.4f}" + (f" Trail={trail:.4f}" if trail else " Trail=pendiente")
+                )
         except Exception as e:
-            log.error(f"Error exit check: {e}")
-        return  # No abrir nuevas mientras hay posición
-
-    # ── Verificar horario ──
-    now = datetime.now(timezone.utc)
-    if not in_session(now):
-        log.info(f"Fuera de horario ({now.strftime('%H:%M UTC')} dow={now.weekday()})")
+            log.error(f"Error check_exit: {e}")
         return
 
-    # ── Buscar señal de entrada ──
+    # ── EJECUTAR SEÑAL PENDIENTE (open de esta vela) ─────────────────────────
+    if pending_signal:
+        log.info(f"Ejecutando señal pendiente: {pending_signal.upper()}")
+        trade = open_position(pending_signal)
+        pending_signal = None
+        if trade:
+            active_trade = trade
+            await send_tg(app, fmt_open(trade))
+        else:
+            log.error("Fallo en apertura")
+        return
+
+    # ── HORARIO ──────────────────────────────────────────────────────────────
+    ts_vela = int(df['open_time'].iloc[-2])
+    if not in_session(ts_vela):
+        log.info(f"Fuera de horario ({datetime.fromtimestamp(ts_vela, tz=timezone.utc).strftime('%H:%M UTC')})")
+        return
+
+    # ── DETECTAR SEÑAL ───────────────────────────────────────────────────────
     try:
         signal = check_signal(df)
     except Exception as e:
-        log.error(f"Error calculando señal: {e}")
+        log.error(f"Error check_signal: {e}")
         return
 
-    if not signal:
-        log.info("Sin señal")
-        return
-
-    log.info(f"Señal: {signal.upper()} — ejecutando...")
-    trade = open_position(client, SYMBOL, signal)
-    if trade:
-        active_trade = trade
-        await send_tg(app, format_open(trade))
+    if signal:
+        log.info(f"Señal: {signal.upper()} — entra próxima vela")
+        pending_signal = signal
     else:
-        log.error("Fallo apertura de posición")
+        log.info("Sin señal")
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
-async def scan_callback(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await scan_job(context.application)
+async def scan_callback(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await scan_job(ctx.application)
 
 async def post_init(app: Application) -> None:
     app.job_queue.run_repeating(
@@ -521,28 +478,25 @@ async def post_init(app: Application) -> None:
         name='scan',
     )
     env = 'TESTNET 🧪' if USE_TESTNET else 'REAL 🔴'
-    log.info(
-        f"Bot iniciado — {SYMBOL} | {env} | Lev: {LEVERAGE}× | "
-        f"EMAs: {EMA_FAST}/{EMA_MID}/{EMA_SLOW} | ADX: {ADX_MIN} | "
-        f"ATR: {ATR_MIN_PCT}% | RSI: {RSI_MIN}/{RSI_MAX} | Vol: {VOL_MULT}×"
-    )
+    log.info(f"Bot iniciado — {SYMBOL} {TF} | {env} | Lev:{LEVERAGE}x Cap:{CAPITAL_PCT}% EMA:{EMA_PERIOD} ADX:{ADX_MIN} ATR:{ATR_MIN_PCT}% SL:{SL_PCT}% Trail:{TRAIL_PCT}%")
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         parse_mode='Markdown',
         text=(
-            f"🤖 *Brújula EMA Stack Bot iniciado* {'🧪 TESTNET' if USE_TESTNET else '🔴 REAL'}\n\n"
-            f"*Par:* `{SYMBOL}` | *Leverage:* `{LEVERAGE}×`\n"
-            f"*EMAs:* `{EMA_FAST}/{EMA_MID}/{EMA_SLOW}` | *ADX:* `{ADX_MIN}`\n"
-            f"*ATR:* `{ATR_MIN_PCT}%` | *RSI:* `{RSI_MIN}/{RSI_MAX}` | *Vol:* `{VOL_MULT}×`\n"
-            f"*Horario:* NY + Asia + Fin de semana\n\n"
-            f"_Escaneando cada {SCAN_INTERVAL}s. /help para comandos._"
+            f"🤖 *Brújula EMA+ADX+ATR Bot* {'🧪 TESTNET' if USE_TESTNET else '🔴 REAL'}\n\n"
+            f"*Par:* `{SYMBOL}` · *TF:* `{TF}` · *Leverage:* `{LEVERAGE}×`\n"
+            f"*EMA:* `{EMA_PERIOD}` · *ADX:* `{ADX_MIN}` · *ATR:* `{ATR_MIN_PCT}%`\n"
+            f"*SL:* `{SL_PCT}%` fijo + trailing `{TRAIL_PCT}%` del swing\n"
+            f"*Capital:* `{CAPITAL_PCT}%` por trade\n"
+            f"*Sesiones:* NY · Londres · Pre-NY · Asia · Finde\n\n"
+            f"_Scan cada {SCAN_INTERVAL}s. /help para comandos._"
         )
     )
 
 def main() -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise ValueError("TELEGRAM_BOT_TOKEN y TELEGRAM_CHAT_ID son requeridos")
-    if not BINANCE_API_KEY or not BINANCE_SECRET:
+    if not BINANCE_KEY or not BINANCE_SECRET:
         raise ValueError("BINANCE_API_KEY y BINANCE_API_SECRET son requeridos")
 
     app = (
@@ -551,11 +505,9 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
-
     app.add_handler(CommandHandler('status', cmd_status))
     app.add_handler(CommandHandler('close',  cmd_close))
     app.add_handler(CommandHandler('help',   cmd_help))
-
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
