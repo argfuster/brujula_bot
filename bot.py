@@ -46,7 +46,7 @@ ATR_MIN_PCT      = float(os.environ.get('ATR_MIN_PCT', '0.25'))
 SL_PCT           = float(os.environ.get('SL_PCT', '0.5'))
 TRAIL_PCT        = float(os.environ.get('TRAIL_PCT', '50'))
 SCAN_INTERVAL    = int(os.environ.get('SCAN_INTERVAL', '60'))
-TF               = '15m'
+TF               = '1h'
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
 active_trade: dict | None = None
@@ -112,15 +112,43 @@ def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(span=period, adjust=False).mean()
 
 def calc_adx(df: pd.DataFrame, period: int) -> pd.Series:
+    """ADX con suavizado de Wilder (RMA, alpha=1/period) — igual que TradingView."""
     up   = df['high'].diff()
     down = -df['low'].diff()
     pdm  = np.where((up > down) & (up > 0), up, 0.0)
     ndm  = np.where((down > up) & (down > 0), down, 0.0)
-    atr  = calc_atr(df, period)
-    pdi  = 100 * pd.Series(pdm, index=df.index).ewm(span=period, adjust=False).mean() / atr
-    ndi  = 100 * pd.Series(ndm, index=df.index).ewm(span=period, adjust=False).mean() / atr
-    dx   = (100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan))
-    return dx.ewm(span=period, adjust=False).mean()
+
+    # TR
+    pc  = df['close'].shift(1)
+    tr  = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - pc).abs(),
+        (df['low']  - pc).abs()
+    ], axis=1).max(axis=1)
+
+    # Wilder smoothing (RMA): primera acumulación por suma, luego prev - prev/n + cur
+    def wilder_smooth(series: pd.Series, n: int) -> pd.Series:
+        result = np.full(len(series), np.nan)
+        # Primera ventana: suma simple
+        first_val = series.iloc[1:n+1].sum()
+        result[n] = first_val
+        for i in range(n + 1, len(series)):
+            result[i] = result[i-1] - result[i-1] / n + series.iloc[i]
+        return pd.Series(result, index=series.index)
+
+    tr_w   = wilder_smooth(tr,                       period)
+    pdm_w  = wilder_smooth(pd.Series(pdm, index=df.index), period)
+    ndm_w  = wilder_smooth(pd.Series(ndm, index=df.index), period)
+
+    pdi = (pdm_w / tr_w * 100).replace([np.inf, -np.inf], np.nan)
+    ndi = (ndm_w / tr_w * 100).replace([np.inf, -np.inf], np.nan)
+
+    dx_sum = (pdi + ndi).replace(0, np.nan)
+    dx  = ((pdi - ndi).abs() / dx_sum * 100)
+
+    # ADX = Wilder smoothing del DX
+    adx = wilder_smooth(dx.fillna(0), period) / period
+    return adx
 
 # ─── HORARIO ──────────────────────────────────────────────────────────────────
 def in_session(ts_sec: int) -> bool:
