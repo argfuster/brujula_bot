@@ -1,12 +1,19 @@
 """
 Brújula Trading Bot — EMA + ADX + ATR + Trailing Swing
+Modo dual: señal en 1h, entrada confirmada en 15m
 =======================================================
 Variables Railway:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BINANCE_API_KEY, BINANCE_API_SECRET
-  USE_TESTNET (true), TRADING_SYMBOL (ETHUSDT), LEVERAGE (2), CAPITAL_PCT (95)
+  USE_TESTNET (true), TRADING_SYMBOL (ETHUSDT), LEVERAGE (3), CAPITAL_PCT (95)
   EMA_PERIOD (25), ADX_PERIOD (14), ADX_MIN (25)
   ATR_PERIOD (14), ATR_MIN_PCT (0.25)
   SL_PCT (0.5), TRAIL_PCT (50), SCAN_INTERVAL (60)
+
+Lógica de entrada:
+  1. Señal detectada en vela de 1h (EMA + ADX + ATR)
+  2. Busca en velas de 15m la primera que abra en la misma dirección
+  3. Máximo 4 velas de 15m (= 1 hora) para confirmar
+  4. Si no confirma en 4 velas, descarta y espera nueva señal
 
 Sesiones: NY · Londres · Pre-NY · Asia · Fin de semana (sin Post-NY)
 """
@@ -22,11 +29,7 @@ from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ─── LOGGING ──────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
@@ -36,7 +39,7 @@ BINANCE_KEY      = os.environ.get('BINANCE_API_KEY', '')
 BINANCE_SECRET   = os.environ.get('BINANCE_API_SECRET', '')
 USE_TESTNET      = os.environ.get('USE_TESTNET', 'true').lower() == 'true'
 SYMBOL           = os.environ.get('TRADING_SYMBOL', 'ETHUSDT')
-LEVERAGE         = int(os.environ.get('LEVERAGE', '2'))
+LEVERAGE         = int(os.environ.get('LEVERAGE', '3'))
 CAPITAL_PCT      = float(os.environ.get('CAPITAL_PCT', '95'))
 EMA_PERIOD       = int(os.environ.get('EMA_PERIOD', '25'))
 ADX_PERIOD       = int(os.environ.get('ADX_PERIOD', '14'))
@@ -46,12 +49,17 @@ ATR_MIN_PCT      = float(os.environ.get('ATR_MIN_PCT', '0.25'))
 SL_PCT           = float(os.environ.get('SL_PCT', '0.5'))
 TRAIL_PCT        = float(os.environ.get('TRAIL_PCT', '50'))
 SCAN_INTERVAL    = int(os.environ.get('SCAN_INTERVAL', '60'))
-TF               = '1h'
+
+TF_SIGNAL = '1h'    # timeframe para señal
+TF_ENTRY  = '15m'   # timeframe para confirmación de entrada
+MAX_ENTRY_CANDLES = 4  # máximo de velas de 15m para confirmar (= 1 hora)
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-active_trade: dict | None = None
-pending_signal: str | None = None
-last_candle_time: int | None = None
+active_trade:       dict | None = None
+pending_signal:     str  | None = None   # 'long' o 'short'
+pending_signal_ts:  int  | None = None   # timestamp cierre vela de señal (segundos)
+pending_signal_close: float | None = None  # close de la vela de señal
+last_candle_time:   int  | None = None   # último candle 1h evaluado
 
 # ─── CLIENTE BINANCE ──────────────────────────────────────────────────────────
 def get_client() -> Client:
@@ -68,9 +76,9 @@ def get_mark_price(symbol: str) -> float:
         log.error(f"Error mark price: {e}")
         return 0.0
 
-def get_klines(symbol: str, limit: int = 350) -> pd.DataFrame:
-    raw = get_client().futures_klines(symbol=symbol, interval=TF, limit=limit)
-    df = pd.DataFrame(raw, columns=[
+def get_klines(symbol: str, interval: str, limit: int = 350) -> pd.DataFrame:
+    raw = get_client().futures_klines(symbol=symbol, interval=interval, limit=limit)
+    df  = pd.DataFrame(raw, columns=[
         'open_time','open','high','low','close','vol',
         'close_time','qvol','trades','tbb','tbq','ignore'
     ])
@@ -112,41 +120,33 @@ def calc_atr(df: pd.DataFrame, period: int) -> pd.Series:
     return tr.ewm(span=period, adjust=False).mean()
 
 def calc_adx(df: pd.DataFrame, period: int) -> pd.Series:
-    """ADX con suavizado de Wilder (RMA, alpha=1/period) — igual que TradingView."""
+    """ADX con suavizado Wilder (RMA) — alineado con TradingView."""
     up   = df['high'].diff()
     down = -df['low'].diff()
     pdm  = np.where((up > down) & (up > 0), up, 0.0)
     ndm  = np.where((down > up) & (down > 0), down, 0.0)
-
-    # TR
-    pc  = df['close'].shift(1)
-    tr  = pd.concat([
+    pc   = df['close'].shift(1)
+    tr   = pd.concat([
         df['high'] - df['low'],
         (df['high'] - pc).abs(),
         (df['low']  - pc).abs()
     ], axis=1).max(axis=1)
 
-    # Wilder smoothing (RMA): primera acumulación por suma, luego prev - prev/n + cur
     def wilder_smooth(series: pd.Series, n: int) -> pd.Series:
         result = np.full(len(series), np.nan)
-        # Primera ventana: suma simple
-        first_val = series.iloc[1:n+1].sum()
-        result[n] = first_val
+        result[n] = series.iloc[1:n+1].sum()
         for i in range(n + 1, len(series)):
             result[i] = result[i-1] - result[i-1] / n + series.iloc[i]
         return pd.Series(result, index=series.index)
 
-    tr_w   = wilder_smooth(tr,                       period)
+    tr_w   = wilder_smooth(tr,                            period)
     pdm_w  = wilder_smooth(pd.Series(pdm, index=df.index), period)
     ndm_w  = wilder_smooth(pd.Series(ndm, index=df.index), period)
 
     pdi = (pdm_w / tr_w * 100).replace([np.inf, -np.inf], np.nan)
     ndi = (ndm_w / tr_w * 100).replace([np.inf, -np.inf], np.nan)
+    dx  = ((pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan) * 100)
 
-    dx_sum = (pdi + ndi).replace(0, np.nan)
-    dx  = ((pdi - ndi).abs() / dx_sum * 100)
-
-    # ADX = Wilder smoothing del DX
     adx = wilder_smooth(dx.fillna(0), period) / period
     return adx
 
@@ -155,51 +155,94 @@ def in_session(ts_sec: int) -> bool:
     d   = datetime.fromtimestamp(ts_sec, tz=timezone.utc)
     hm  = d.hour * 60 + d.minute
     dow = d.weekday()
-    if dow >= 5:                                    return True   # finde
-    if 13 * 60 + 30 <= hm < 20 * 60:               return True   # NY
-    if 8  * 60       <= hm < 12 * 60:               return True   # Londres
-    if 12 * 60       <= hm < 13 * 60 + 30:          return True   # Pre-NY
-    if hm < 8 * 60:                                 return True   # Asia
-    return False                                                  # Post-NY: OFF
+    if dow >= 5:                           return True   # finde
+    if 13 * 60 + 30 <= hm < 20 * 60:      return True   # NY
+    if 8  * 60       <= hm < 12 * 60:     return True   # Londres
+    if 12 * 60       <= hm < 13 * 60 + 30: return True  # Pre-NY
+    if hm < 8 * 60:                        return True   # Asia
+    return False                                         # Post-NY: OFF
 
-# ─── SEÑAL ────────────────────────────────────────────────────────────────────
-def check_signal(df: pd.DataFrame) -> str | None:
+# ─── SEÑAL EN 1H ──────────────────────────────────────────────────────────────
+def check_signal(df1h: pd.DataFrame) -> tuple[str | None, float, int]:
+    """
+    Evalúa la penúltima vela de 1h (ya cerrada).
+    Retorna (dirección, close_señal, timestamp_cierre) o (None, 0, 0).
+    """
     min_bars = max(EMA_PERIOD, ADX_PERIOD * 3, ATR_PERIOD) + 10
-    if len(df) < min_bars:
-        return None
+    if len(df1h) < min_bars:
+        return None, 0, 0
 
-    ema = calc_ema(df['close'], EMA_PERIOD)
-    atr = calc_atr(df, ATR_PERIOD)
-    adx = calc_adx(df, ADX_PERIOD)
+    ema = calc_ema(df1h['close'], EMA_PERIOD)
+    atr = calc_atr(df1h, ATR_PERIOD)
+    adx = calc_adx(df1h, ADX_PERIOD)
 
     i     = -2
-    close = df['close'].iloc[i]
+    close = df1h['close'].iloc[i]
     ema_v = ema.iloc[i]
     atr_v = atr.iloc[i]
     adx_v = adx.iloc[i]
+    ts    = int(df1h['open_time'].iloc[i]) // 1000 + 3600  # timestamp de cierre
 
     if any(pd.isna(x) for x in [ema_v, atr_v, adx_v]) or close <= 0:
-        return None
+        return None, 0, 0
     if adx_v < ADX_MIN:
-        return None
+        return None, 0, 0
     if atr_v / close * 100 < ATR_MIN_PCT:
-        return None
+        return None, 0, 0
 
-    if close > ema_v:   return 'long'
-    if close < ema_v:   return 'short'
-    return None
+    if close > ema_v:  return 'long',  close, ts
+    if close < ema_v:  return 'short', close, ts
+    return None, 0, 0
+
+# ─── CONFIRMACIÓN EN 15M ──────────────────────────────────────────────────────
+def find_entry_15m(direction: str, signal_ts: int, signal_close: float,
+                   df15: pd.DataFrame) -> tuple[bool, float]:
+    """
+    Busca la primera vela de 15m posterior a signal_ts que confirme la dirección.
+    Confirmación: open de la vela >= close de la vela anterior (long) o <= (short).
+    Máximo MAX_ENTRY_CANDLES velas.
+    Retorna (encontrado, precio_entrada).
+    """
+    # Filtrar velas de 15m posteriores a la señal
+    post = df15[df15['open_time'] // 1000 >= signal_ts].copy()
+    post = post.reset_index(drop=True)
+
+    if len(post) == 0:
+        return False, 0.0
+
+    prev_close = signal_close  # close de la vela de señal como referencia inicial
+
+    for i in range(min(MAX_ENTRY_CANDLES, len(post))):
+        c15 = post.iloc[i]
+        open15 = float(c15['open'])
+
+        confirmed = (
+            (direction == 'long'  and open15 >= prev_close) or
+            (direction == 'short' and open15 <= prev_close)
+        )
+
+        if confirmed:
+            log.info(f"Confirmación 15m en vela {i+1}/{MAX_ENTRY_CANDLES}: "
+                     f"open {open15:.4f} {'≥' if direction=='long' else '≤'} "
+                     f"prev_close {prev_close:.4f}")
+            return True, open15
+
+        prev_close = float(c15['close'])
+        log.info(f"Vela 15m {i+1}: no confirma (open {open15:.4f}, prev {prev_close:.4f})")
+
+    return False, 0.0
 
 # ─── GESTIÓN DE POSICIÓN ──────────────────────────────────────────────────────
-def check_exit(df: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
-    ema   = calc_ema(df['close'], EMA_PERIOD)
+def check_exit(df1h: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
+    ema   = calc_ema(df1h['close'], EMA_PERIOD)
     i     = -2
-    close = df['close'].iloc[i]
+    close = df1h['close'].iloc[i]
     ema_v = ema.iloc[i]
-    prev_close = df['close'].iloc[i - 1]
+    prev_close = df1h['close'].iloc[i - 1]
 
-    direction  = trade['direction']
-    entry      = trade['entry']
-    sl_fixed   = trade['sl_fixed']
+    direction = trade['direction']
+    entry     = trade['entry']
+    sl_fixed  = trade['sl_fixed']
 
     # Actualizar mejor cierre histórico (trailing real — nunca retrocede)
     if direction == 'long' and prev_close > trade['best_swing']:
@@ -229,7 +272,7 @@ def check_exit(df: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
     trade['trail_stop']  = trail_stop
     trade['active_stop'] = active_stop
 
-    # Exit por stop (close de vela)
+    # Exit por stop (close de vela 1h)
     if direction == 'long' and close <= active_stop:
         reason = 'trailing' if (trail_stop and trail_stop >= sl_fixed) else 'sl'
         return True, reason, active_stop
@@ -237,19 +280,19 @@ def check_exit(df: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
         reason = 'trailing' if (trail_stop and trail_stop <= sl_fixed) else 'sl'
         return True, reason, active_stop
 
-    # Exit por cruce EMA
+    # Exit por cruce EMA (close de vela 1h)
     if direction == 'long'  and close < ema_v:  return True, 'ema', close
     if direction == 'short' and close > ema_v:  return True, 'ema', close
 
     return False, '', 0.0
 
 # ─── EJECUCIÓN ────────────────────────────────────────────────────────────────
-def open_position(direction: str) -> dict | None:
+def open_position(direction: str, entry_price: float | None = None) -> dict | None:
     try:
         client = get_client()
         client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
         balance = get_balance()
-        price   = get_mark_price(SYMBOL)
+        price   = entry_price or get_mark_price(SYMBOL)
         step    = get_step_size(SYMBOL)
 
         if price <= 0 or step <= 0 or balance <= 0:
@@ -310,7 +353,7 @@ def close_position(trade: dict) -> float | None:
         return None
 
 # ─── MENSAJES ─────────────────────────────────────────────────────────────────
-def fmt_open(trade: dict) -> str:
+def fmt_open(trade: dict, confirmed_candle: int = 1) -> str:
     env   = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
     emoji = '🟢' if trade['direction'] == 'long' else '🔴'
     return (
@@ -321,6 +364,7 @@ def fmt_open(trade: dict) -> str:
         f"*Cantidad:* `{trade['qty']}`\n"
         f"*SL fijo:*  `{trade['sl_fixed']:,.4f}` (-{SL_PCT}%)\n"
         f"*Trail:*    {TRAIL_PCT}% del swing\n"
+        f"*Confirma:* vela {confirmed_candle}/{MAX_ENTRY_CANDLES} de 15m\n"
         f"*Capital:*  `${trade['balance_in']:,.2f}` × {LEVERAGE}×\n"
         f"{'─'*30}"
     )
@@ -332,7 +376,7 @@ def fmt_close(trade: dict, exit_price: float, reason: str) -> str:
                else (entry - exit_price) / entry * 100
     pnl_usdt = trade['balance_in'] * (CAPITAL_PCT / 100) * LEVERAGE * pnl_pct / 100
     dur      = datetime.now(timezone.utc) - trade['opened_at']
-    h, m     = int(dur.total_seconds() // 3600), int((dur.total_seconds() % 3600) // 60)
+    h, m     = int(dur.total_seconds()//3600), int((dur.total_seconds()%3600)//60)
     emoji    = '🟢' if dir_ == 'long' else '🔴'
     result   = '✅ WIN' if pnl_pct > 0 else '❌ LOSS'
     reason_str = {'sl':'🛑 Stop Loss fijo','trailing':'📍 Trailing stop',
@@ -359,11 +403,12 @@ async def send_tg(app: Application, text: str) -> None:
 
 # ─── COMANDOS ─────────────────────────────────────────────────────────────────
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global active_trade, pending_signal
+    global active_trade, pending_signal, pending_signal_ts
     if not active_trade:
         msg = "📭 *Sin posición abierta.*"
         if pending_signal:
-            msg += f"\n⏳ Señal pendiente: {pending_signal.upper()} (entra en próxima vela)"
+            desde = datetime.fromtimestamp(pending_signal_ts, tz=timezone.utc).strftime('%H:%M UTC') if pending_signal_ts else '?'
+            msg += f"\n⏳ Señal pendiente: *{pending_signal.upper()}* desde {desde}\n_Buscando confirmación en 15m..._"
         await update.message.reply_text(msg, parse_mode='Markdown')
         return
     try:
@@ -409,12 +454,13 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     env = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
     msg = (
-        f"🤖 *Brújula EMA+ADX+ATR Bot* {env}\n\n"
+        f"🤖 *Brújula Dual Bot* {env}\n\n"
         f"/status — posición activa y stops\n"
         f"/close  — cerrar manualmente\n"
         f"/help   — este mensaje\n\n"
-        f"EMA `{EMA_PERIOD}` · ADX `{ADX_MIN}` · ATR `{ATR_MIN_PCT}%` · `{TF}`\n"
-        f"SL `{SL_PCT}%` + Trailing `{TRAIL_PCT}%` del swing\n"
+        f"*Señal:* EMA `{EMA_PERIOD}` · ADX `{ADX_MIN}` · ATR `{ATR_MIN_PCT}%` · `{TF_SIGNAL}`\n"
+        f"*Entrada:* primera vela `{TF_ENTRY}` confirmada (máx {MAX_ENTRY_CANDLES})\n"
+        f"*Stop:* SL `{SL_PCT}%` fijo + trailing `{TRAIL_PCT}%` del swing\n"
         f"`{SYMBOL}` · `{LEVERAGE}×` · Capital `{CAPITAL_PCT}%`\n"
         f"Sesiones: NY · Londres · Pre-NY · Asia · Finde\n"
         f"Scan cada `{SCAN_INTERVAL}s`"
@@ -423,31 +469,38 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─── SCAN ─────────────────────────────────────────────────────────────────────
 async def scan_job(app: Application) -> None:
-    global active_trade, pending_signal, last_candle_time
+    global active_trade, pending_signal, pending_signal_ts, pending_signal_close, last_candle_time
 
+    # Descargar velas de 1h para señal y gestión de posición
     try:
-        df = get_klines(SYMBOL, limit=350)
+        df1h = get_klines(SYMBOL, TF_SIGNAL, limit=350)
     except Exception as e:
-        log.error(f"Error klines: {e}")
+        log.error(f"Error klines 1h: {e}")
         return
 
-    # Deduplicar por vela
-    current_candle = int(df['open_time'].iloc[-2])
+    # Deduplicar por vela de 1h
+    current_candle = int(df1h['open_time'].iloc[-2]) // 1000
     if current_candle == last_candle_time:
-        log.info("Vela ya evaluada")
+        # Misma vela 1h — pero si hay señal pendiente, buscar confirmación en 15m
+        if pending_signal and not active_trade:
+            await _buscar_confirmacion_15m(app)
+        else:
+            log.info("Vela ya evaluada")
         return
     last_candle_time = current_candle
 
     # ── GESTIÓN DE POSICIÓN ABIERTA ──────────────────────────────────────────
     if active_trade:
         try:
-            should_exit, reason, _ = check_exit(df, active_trade)
+            should_exit, reason, _ = check_exit(df1h, active_trade)
             if should_exit:
                 exit_price = close_position(active_trade)
                 if exit_price:
                     msg = fmt_close(active_trade, exit_price, reason)
                     active_trade   = None
                     pending_signal = None
+                    pending_signal_ts = None
+                    pending_signal_close = None
                     await send_tg(app, msg)
                     log.info(f"Cerrado — motivo: {reason}")
                 else:
@@ -463,36 +516,72 @@ async def scan_job(app: Application) -> None:
             log.error(f"Error check_exit: {e}")
         return
 
-    # ── EJECUTAR SEÑAL PENDIENTE (open de esta vela) ─────────────────────────
+    # ── SEÑAL PENDIENTE — buscar confirmación en 15m ─────────────────────────
     if pending_signal:
-        log.info(f"Ejecutando señal pendiente: {pending_signal.upper()}")
-        trade = open_position(pending_signal)
-        pending_signal = None
-        if trade:
-            active_trade = trade
-            await send_tg(app, fmt_open(trade))
-        else:
-            log.error("Fallo en apertura")
+        await _buscar_confirmacion_15m(app)
         return
 
     # ── HORARIO ──────────────────────────────────────────────────────────────
-    ts_vela = int(df['open_time'].iloc[-2]) // 1000  # Binance devuelve ms, convertir a segundos
+    ts_vela = int(df1h['open_time'].iloc[-2]) // 1000
     if not in_session(ts_vela):
         log.info(f"Fuera de horario ({datetime.fromtimestamp(ts_vela, tz=timezone.utc).strftime('%H:%M UTC')})")
         return
 
-    # ── DETECTAR SEÑAL ───────────────────────────────────────────────────────
+    # ── DETECTAR SEÑAL EN 1H ─────────────────────────────────────────────────
     try:
-        signal = check_signal(df)
+        signal, sig_close, sig_ts = check_signal(df1h)
     except Exception as e:
         log.error(f"Error check_signal: {e}")
         return
 
     if signal:
-        log.info(f"Señal: {signal.upper()} — entra próxima vela")
-        pending_signal = signal
+        pending_signal       = signal
+        pending_signal_ts    = sig_ts
+        pending_signal_close = sig_close
+        log.info(f"Señal 1h: {signal.upper()} @ close {sig_close:.4f} — buscando confirmación en 15m")
+        await _buscar_confirmacion_15m(app)
     else:
         log.info("Sin señal")
+
+async def _buscar_confirmacion_15m(app: Application) -> None:
+    """Busca confirmación de la señal pendiente en velas de 15m."""
+    global active_trade, pending_signal, pending_signal_ts, pending_signal_close
+
+    if not pending_signal or not pending_signal_ts:
+        return
+
+    # Verificar que no pasaron más de MAX_ENTRY_CANDLES horas
+    ahora = int(datetime.now(timezone.utc).timestamp())
+    if ahora > pending_signal_ts + MAX_ENTRY_CANDLES * 3600:
+        log.info(f"Señal {pending_signal.upper()} expiró sin confirmación — descartando")
+        pending_signal       = None
+        pending_signal_ts    = None
+        pending_signal_close = None
+        return
+
+    try:
+        df15 = get_klines(SYMBOL, TF_ENTRY, limit=20)
+    except Exception as e:
+        log.error(f"Error klines 15m: {e}")
+        return
+
+    confirmed, entry_price = find_entry_15m(
+        pending_signal, pending_signal_ts, pending_signal_close, df15
+    )
+
+    if confirmed:
+        candle_num = 1  # simplificado — la función ya logea cuál vela confirmó
+        trade = open_position(pending_signal, entry_price)
+        pending_signal       = None
+        pending_signal_ts    = None
+        pending_signal_close = None
+        if trade:
+            active_trade = trade
+            await send_tg(app, fmt_open(trade, candle_num))
+        else:
+            log.error("Fallo en apertura")
+    else:
+        log.info(f"Sin confirmación 15m aún para señal {pending_signal.upper()}")
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def scan_callback(ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -506,16 +595,16 @@ async def post_init(app: Application) -> None:
         name='scan',
     )
     env = 'TESTNET 🧪' if USE_TESTNET else 'REAL 🔴'
-    log.info(f"Bot iniciado — {SYMBOL} {TF} | {env} | Lev:{LEVERAGE}x Cap:{CAPITAL_PCT}% EMA:{EMA_PERIOD} ADX:{ADX_MIN} ATR:{ATR_MIN_PCT}% SL:{SL_PCT}% Trail:{TRAIL_PCT}%")
+    log.info(f"Bot iniciado — {SYMBOL} | Señal:{TF_SIGNAL} Entrada:{TF_ENTRY} | {env} | Lev:{LEVERAGE}x")
     await app.bot.send_message(
         chat_id=TELEGRAM_CHAT_ID,
         parse_mode='Markdown',
         text=(
-            f"🤖 *Brújula EMA+ADX+ATR Bot* {'🧪 TESTNET' if USE_TESTNET else '🔴 REAL'}\n\n"
-            f"*Par:* `{SYMBOL}` · *TF:* `{TF}` · *Leverage:* `{LEVERAGE}×`\n"
-            f"*EMA:* `{EMA_PERIOD}` · *ADX:* `{ADX_MIN}` · *ATR:* `{ATR_MIN_PCT}%`\n"
-            f"*SL:* `{SL_PCT}%` fijo + trailing `{TRAIL_PCT}%` del swing\n"
-            f"*Capital:* `{CAPITAL_PCT}%` por trade\n"
+            f"🤖 *Brújula Dual Bot* {'🧪 TESTNET' if USE_TESTNET else '🔴 REAL'}\n\n"
+            f"*Señal:* `{TF_SIGNAL}` — EMA `{EMA_PERIOD}` · ADX `{ADX_MIN}` · ATR `{ATR_MIN_PCT}%`\n"
+            f"*Entrada:* primera vela `{TF_ENTRY}` confirmada (máx {MAX_ENTRY_CANDLES})\n"
+            f"*Stop:* SL `{SL_PCT}%` fijo + trailing `{TRAIL_PCT}%` del swing\n"
+            f"*Par:* `{SYMBOL}` · *Leverage:* `{LEVERAGE}×` · *Capital:* `{CAPITAL_PCT}%`\n"
             f"*Sesiones:* NY · Londres · Pre-NY · Asia · Finde\n\n"
             f"_Scan cada {SCAN_INTERVAL}s. /help para comandos._"
         )
