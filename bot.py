@@ -448,7 +448,7 @@ async def scan_job(app: Application) -> None:
         return
 
     # ── HORARIO ──────────────────────────────────────────────────────────────
-    ts_vela = int(df['open_time'].iloc[-2])
+    ts_vela = int(df['open_time'].iloc[-2]) // 1000  # Binance devuelve ms, convertir a segundos
     if not in_session(ts_vela):
         log.info(f"Fuera de horario ({datetime.fromtimestamp(ts_vela, tz=timezone.utc).strftime('%H:%M UTC')})")
         return
