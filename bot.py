@@ -290,10 +290,21 @@ def check_exit(df1h: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
 def open_position(direction: str, entry_price: float | None = None) -> dict | None:
     try:
         client = get_client()
-        client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+
+        # Configurar margen cruzado y leverage
+        try:
+            client.futures_change_margin_type(symbol=SYMBOL, marginType='CROSSED')
+        except Exception:
+            pass  # Ya está en CROSSED — Binance lanza excepción si no cambia
+
+        lev_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        log.info(f"Leverage configurado: {lev_resp}")
+
         balance = get_balance()
         price   = entry_price or get_mark_price(SYMBOL)
         step    = get_step_size(SYMBOL)
+
+        log.info(f"Balance: ${balance:.2f} | Precio: {price:.4f} | Step: {step} | Capital%: {CAPITAL_PCT} | Lev: {LEVERAGE}x")
 
         if price <= 0 or step <= 0 or balance <= 0:
             log.error(f"Datos inválidos: price={price} step={step} balance={balance}")
