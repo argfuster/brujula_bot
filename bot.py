@@ -196,24 +196,31 @@ def check_signal(df1h: pd.DataFrame) -> tuple[str | None, float, int]:
 
 # ─── CONFIRMACIÓN EN 15M ──────────────────────────────────────────────────────
 def find_entry_15m(direction: str, signal_ts: int, signal_close: float,
-                   df15: pd.DataFrame) -> tuple[bool, float]:
+                   df15: pd.DataFrame) -> tuple[bool, float, bool]:
     """
-    Busca la primera vela de 15m posterior a signal_ts que confirme la dirección.
-    Confirmación: open de la vela >= close de la vela anterior (long) o <= (short).
-    Máximo MAX_ENTRY_CANDLES velas.
-    Retorna (encontrado, precio_entrada).
+    Busca confirmación en velas de 15m desde signal_ts.
+    Itera TODAS las velas cerradas disponibles desde la señal.
+    Retorna (confirmado, precio_entrada, expirado).
+    expirado=True si ya pasaron MAX_ENTRY_CANDLES velas sin confirmar.
     """
-    # Filtrar velas de 15m posteriores a la señal
-    post = df15[df15['open_time'] // 1000 >= signal_ts].copy()
+    # Velas cerradas posteriores a la señal (excluir la última que puede estar abierta)
+    post = df15[(df15['open_time'] // 1000 >= signal_ts)].copy()
     post = post.reset_index(drop=True)
 
+    # Excluir la última vela (puede estar abierta aún)
+    if len(post) > 1:
+        post = post.iloc[:-1]
+    elif len(post) == 1:
+        # Solo hay una vela — puede estar aún abierta, esperar
+        return False, 0.0, False
+
     if len(post) == 0:
-        return False, 0.0
+        return False, 0.0, False
 
-    prev_close = signal_close  # close de la vela de señal como referencia inicial
+    prev_close = signal_close
 
-    for i in range(min(MAX_ENTRY_CANDLES, len(post))):
-        c15 = post.iloc[i]
+    for i in range(len(post)):
+        c15    = post.iloc[i]
         open15 = float(c15['open'])
 
         confirmed = (
@@ -225,12 +232,17 @@ def find_entry_15m(direction: str, signal_ts: int, signal_close: float,
             log.info(f"Confirmación 15m en vela {i+1}/{MAX_ENTRY_CANDLES}: "
                      f"open {open15:.4f} {'≥' if direction=='long' else '≤'} "
                      f"prev_close {prev_close:.4f}")
-            return True, open15
+            return True, open15, False
 
         prev_close = float(c15['close'])
         log.info(f"Vela 15m {i+1}: no confirma (open {open15:.4f}, prev {prev_close:.4f})")
 
-    return False, 0.0
+        # Si llegamos al máximo de velas sin confirmar, expirar
+        if i + 1 >= MAX_ENTRY_CANDLES:
+            log.info(f"Señal expiró tras {MAX_ENTRY_CANDLES} velas de 15m sin confirmación")
+            return False, 0.0, True
+
+    return False, 0.0, False
 
 # ─── GESTIÓN DE POSICIÓN ──────────────────────────────────────────────────────
 def check_exit(df1h: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
@@ -244,11 +256,11 @@ def check_exit(df1h: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
     entry     = trade['entry']
     sl_fixed  = trade['sl_fixed']
 
-    # Actualizar mejor cierre histórico (trailing real — nunca retrocede)
-    if direction == 'long' and prev_close > trade['best_swing']:
-        trade['best_swing'] = prev_close
-    elif direction == 'short' and prev_close < trade['best_swing']:
-        trade['best_swing'] = prev_close
+    # Actualizar mejor cierre histórico con close de la vela actual
+    if direction == 'long' and close > trade['best_swing']:
+        trade['best_swing'] = close
+    elif direction == 'short' and close < trade['best_swing']:
+        trade['best_swing'] = close
 
     best_swing = trade['best_swing']
 
@@ -364,7 +376,7 @@ def close_position(trade: dict) -> float | None:
         return None
 
 # ─── MENSAJES ─────────────────────────────────────────────────────────────────
-def fmt_open(trade: dict, confirmed_candle: int = 1) -> str:
+def fmt_open(trade: dict) -> str:
     env   = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
     emoji = '🟢' if trade['direction'] == 'long' else '🔴'
     return (
@@ -375,7 +387,6 @@ def fmt_open(trade: dict, confirmed_candle: int = 1) -> str:
         f"*Cantidad:* `{trade['qty']}`\n"
         f"*SL fijo:*  `{trade['sl_fixed']:,.4f}` (-{SL_PCT}%)\n"
         f"*Trail:*    {TRAIL_PCT}% del swing\n"
-        f"*Confirma:* vela {confirmed_candle}/{MAX_ENTRY_CANDLES} de 15m\n"
         f"*Capital:*  `${trade['balance_in']:,.2f}` × {LEVERAGE}×\n"
         f"{'─'*30}"
     )
@@ -561,36 +572,32 @@ async def _buscar_confirmacion_15m(app: Application) -> None:
     if not pending_signal or not pending_signal_ts:
         return
 
-    # Verificar que no pasaron más de MAX_ENTRY_CANDLES horas
-    ahora = int(datetime.now(timezone.utc).timestamp())
-    if ahora > pending_signal_ts + MAX_ENTRY_CANDLES * 3600:
-        log.info(f"Señal {pending_signal.upper()} expiró sin confirmación — descartando")
-        pending_signal       = None
-        pending_signal_ts    = None
-        pending_signal_close = None
-        return
-
     try:
         df15 = get_klines(SYMBOL, TF_ENTRY, limit=20)
     except Exception as e:
         log.error(f"Error klines 15m: {e}")
         return
 
-    confirmed, entry_price = find_entry_15m(
+    confirmed, entry_price, expired = find_entry_15m(
         pending_signal, pending_signal_ts, pending_signal_close, df15
     )
 
     if confirmed:
-        candle_num = 1  # simplificado — la función ya logea cuál vela confirmó
-        trade = open_position(pending_signal, entry_price)
+        signal_dir = pending_signal
         pending_signal       = None
         pending_signal_ts    = None
         pending_signal_close = None
+        trade = open_position(signal_dir, entry_price)
         if trade:
             active_trade = trade
-            await send_tg(app, fmt_open(trade, candle_num))
+            await send_tg(app, fmt_open(trade))
         else:
             log.error("Fallo en apertura")
+    elif expired:
+        log.info(f"Señal {pending_signal.upper()} descartada — no confirmó en {MAX_ENTRY_CANDLES} velas de 15m")
+        pending_signal       = None
+        pending_signal_ts    = None
+        pending_signal_close = None
     else:
         log.info(f"Sin confirmación 15m aún para señal {pending_signal.upper()}")
 
