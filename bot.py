@@ -172,16 +172,19 @@ def check_signal(df1h: pd.DataFrame) -> tuple[str | None, float, int]:
     if len(df1h) < min_bars:
         return None, 0, 0
 
-    ema = calc_ema(df1h['close'], EMA_PERIOD)
-    atr = calc_atr(df1h, ATR_PERIOD)
-    adx = calc_adx(df1h, ADX_PERIOD)
+    # Excluir la última vela (abierta, valores parciales) antes de calcular indicadores
+    df = df1h.iloc[:-1].copy()
 
-    i     = -2
-    close = df1h['close'].iloc[i]
+    ema = calc_ema(df['close'], EMA_PERIOD)
+    atr = calc_atr(df, ATR_PERIOD)
+    adx = calc_adx(df, ADX_PERIOD)
+
+    i     = -1   # última vela cerrada (penúltima del DataFrame original)
+    close = df['close'].iloc[i]
     ema_v = ema.iloc[i]
     atr_v = atr.iloc[i]
     adx_v = adx.iloc[i]
-    ts    = int(df1h['open_time'].iloc[i]) // 1000 + 3600  # timestamp de cierre
+    ts    = int(df['open_time'].iloc[i]) // 1000 + 3600  # timestamp de cierre
 
     if any(pd.isna(x) for x in [ema_v, atr_v, adx_v]) or close <= 0:
         return None, 0, 0
@@ -255,11 +258,13 @@ def find_entry_15m(direction: str, signal_ts: int, signal_close: float,
 
 # ─── GESTIÓN DE POSICIÓN ──────────────────────────────────────────────────────
 def check_exit(df1h: pd.DataFrame, trade: dict) -> tuple[bool, str, float]:
-    ema   = calc_ema(df1h['close'], EMA_PERIOD)
-    i     = -2
-    close = df1h['close'].iloc[i]
+    # Excluir la última vela (abierta) antes de calcular indicadores
+    df_c  = df1h.iloc[:-1].copy()
+    ema   = calc_ema(df_c['close'], EMA_PERIOD)
+    i     = -1
+    close = df_c['close'].iloc[i]
     ema_v = ema.iloc[i]
-    prev_close = df1h['close'].iloc[i - 1]
+    prev_close = df_c['close'].iloc[i - 1]
 
     direction = trade['direction']
     entry     = trade['entry']
