@@ -185,9 +185,18 @@ def check_signal(df1h: pd.DataFrame) -> tuple[str | None, float, int]:
 
     if any(pd.isna(x) for x in [ema_v, atr_v, adx_v]) or close <= 0:
         return None, 0, 0
+    atr_pct = atr_v / close * 100
+    dir_str = 'SHORT' if close < ema_v else ('LONG' if close > ema_v else '=EMA')
+    log.info(
+        f"Indicadores | close={close:.2f} EMA={ema_v:.2f} "
+        f"ADX={adx_v:.2f}/{ADX_MIN} ATR={atr_pct:.3f}%/{ATR_MIN_PCT}% | {dir_str}"
+    )
+
     if adx_v < ADX_MIN:
+        log.info(f"Filtrado ADX: {adx_v:.2f} < {ADX_MIN}")
         return None, 0, 0
-    if atr_v / close * 100 < ATR_MIN_PCT:
+    if atr_pct < ATR_MIN_PCT:
+        log.info(f"Filtrado ATR: {atr_pct:.3f}% < {ATR_MIN_PCT}%")
         return None, 0, 0
 
     if close > ema_v:  return 'long',  close, ts
