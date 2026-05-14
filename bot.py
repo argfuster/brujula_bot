@@ -317,14 +317,22 @@ def open_position(direction: str, entry_price: float | None = None) -> dict | No
     try:
         client = get_client()
 
-        # Configurar margen cruzado y leverage
+        # Configurar margen cruzado
         try:
             client.futures_change_margin_type(symbol=SYMBOL, marginType='CROSSED')
         except Exception:
-            pass  # Ya está en CROSSED — Binance lanza excepción si no cambia
+            pass  # Ya está en CROSSED
 
-        lev_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        log.info(f"Leverage configurado: {lev_resp}")
+        # Intentar configurar leverage — si falla, reducir hasta que funcione
+        lev_usado = LEVERAGE
+        for lev_try in [LEVERAGE, LEVERAGE - 1, 1]:
+            try:
+                lev_resp = client.futures_change_leverage(symbol=SYMBOL, leverage=lev_try)
+                lev_usado = lev_try
+                log.info(f"Leverage configurado: {lev_try}x")
+                break
+            except Exception as e:
+                log.warning(f"Leverage {lev_try}x rechazado: {e}")
 
         balance = get_balance()
         price   = entry_price or get_mark_price(SYMBOL)
@@ -336,7 +344,7 @@ def open_position(direction: str, entry_price: float | None = None) -> dict | No
             log.error(f"Datos inválidos: price={price} step={step} balance={balance}")
             return None
 
-        notional = balance * (CAPITAL_PCT / 100) * LEVERAGE
+        notional = balance * (CAPITAL_PCT / 100) * lev_usado
         qty      = notional / price
         qty      = qty - (qty % step)
         qty      = round(qty, 8)
@@ -350,10 +358,28 @@ def open_position(direction: str, entry_price: float | None = None) -> dict | No
             symbol=SYMBOL, side=side,
             type=ORDER_TYPE_MARKET, quantity=qty
         )
-        raw_fill = float(order.get('avgPrice') or 0)
-        entry    = raw_fill if raw_fill > 0 else price
+        raw_fill  = float(order.get('avgPrice') or 0)
+        entry_est = raw_fill if raw_fill > 0 else price
+
+        # Obtener precio real de entrada desde la posición
+        try:
+            import time as _time
+            _time.sleep(1)
+            positions = client.futures_position_information(symbol=SYMBOL)
+            entry = entry_est
+            for pos in positions:
+                if pos['symbol'] == SYMBOL and abs(float(pos['positionAmt'])) > 0:
+                    ep = float(pos['entryPrice'])
+                    if ep > 0:
+                        entry = ep
+                        log.info(f"Precio real: {entry:.4f} (estimado: {entry_est:.4f})")
+                    break
+        except Exception as e:
+            log.warning(f"No se pudo obtener entryPrice: {e}")
+            entry = entry_est
+
         sl_fixed = entry * (1 - SL_PCT / 100) if direction == 'long' \
-                   else entry * (1 + SL_PCT / 100)
+                   else entry * (1 + SL_PCT / 100) * (1 + SL_PCT / 100)
 
         log.info(f"Abierto: {direction.upper()} {qty} {SYMBOL} @ {entry:.4f} SL={sl_fixed:.4f}")
         return {
@@ -517,13 +543,28 @@ async def scan_job(app: Application) -> None:
     # Deduplicar por vela de 1h
     current_candle = int(df1h['open_time'].iloc[-2]) // 1000
     if current_candle == last_candle_time:
-        # Misma vela 1h — pero si hay señal pendiente, buscar confirmación en 15m
         if pending_signal and not active_trade:
             await _buscar_confirmacion_15m(app)
         else:
             log.info("Vela ya evaluada")
         return
     last_candle_time = current_candle
+
+    # Si hay trade abierto, actualizar best_swing con TODAS las velas
+    # cerradas desde la última evaluada (evita perder mínimos/máximos intermedios)
+    if active_trade:
+        direction = active_trade['direction']
+        entry_ts  = int(active_trade['opened_at'].timestamp())
+        df_closed = df1h.iloc[:-1]  # excluir vela abierta
+        for _, row in df_closed.iterrows():
+            row_ts = int(row['open_time']) // 1000
+            if row_ts < entry_ts:
+                continue
+            c = float(row['close'])
+            if direction == 'long' and c > active_trade['best_swing']:
+                active_trade['best_swing'] = c
+            elif direction == 'short' and c < active_trade['best_swing']:
+                active_trade['best_swing'] = c
 
     # ── GESTIÓN DE POSICIÓN ABIERTA ──────────────────────────────────────────
     if active_trade:
