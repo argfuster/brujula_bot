@@ -621,12 +621,51 @@ async def scan_job(app: Application) -> None:
         if not position_is_open(active_trade['symbol']):
             reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
             exit_price = active_trade.get('active_stop', active_trade['sl_fixed'])
+            closed_trade = active_trade
             log.info(f"Posición cerrada por Binance — razón: {reason} @ {exit_price:.4f}")
-            msg = fmt_close(active_trade, exit_price, reason)
-            active_trade      = None
-            pending_signal    = None
-            pending_signal_ts = None
+            msg = fmt_close(closed_trade, exit_price, reason)
+            active_trade = None
             await send_tg(app, msg)
+
+            # ── REENTRADA: verificar si seguimos dentro de la misma vela 4h ──
+            # El tester reingresa si el sesgo 4h sigue vigente y hay vela 15m confirmadora
+            try:
+                now_ts    = int(time.time())
+                # Inicio de la vela 4h actual (múltiplo de 14400)
+                vela_4h_open  = (now_ts // 14400) * 14400
+                vela_4h_close = vela_4h_open + 14400
+
+                # ¿Queda tiempo dentro de la vela 4h? (al menos 1 vela de 15m = 900s)
+                tiempo_restante = vela_4h_close - now_ts
+                if tiempo_restante >= 900:
+                    df4h = get_klines(SYMBOL, '4h', limit=100)
+                    signal, sig_ts = check_signal_4h(df4h)
+
+                    # El sesgo debe coincidir con el trade que cerró
+                    if signal == closed_trade['direction']:
+                        log.info(f"Reentrada posible: sesgo {signal.upper()} sigue vigente, {tiempo_restante//60}min restantes en vela 4h")
+                        # Buscar desde el timestamp de cierre del stop (exit_price moment ≈ now)
+                        exit_ts = int(time.time()) - 60  # retroceder 1 min para no perder la vela actual
+                        pending_signal    = signal
+                        pending_signal_ts = exit_ts
+                        await send_tg(app,
+                            f"🔄 *Reentrada buscada* — sesgo {signal.upper()} sigue vigente
+"
+                            f"Buscando 1ª vela 15m {'verde 🟢' if signal=='long' else 'roja 🔴'} "
+                            f"({tiempo_restante//60}min restantes en vela 4h)"
+                        )
+                    else:
+                        log.info(f"No reentrada: sesgo cambió o ADX insuficiente")
+                        pending_signal    = None
+                        pending_signal_ts = None
+                else:
+                    log.info(f"No reentrada: quedan solo {tiempo_restante}s en vela 4h (< 15min)")
+                    pending_signal    = None
+                    pending_signal_ts = None
+            except Exception as e:
+                log.error(f"Error evaluando reentrada: {e}")
+                pending_signal    = None
+                pending_signal_ts = None
             return
 
         # 2. Actualizar trailing si hay nueva vela de 1h cerrada
