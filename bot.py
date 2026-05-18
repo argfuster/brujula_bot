@@ -649,8 +649,7 @@ async def scan_job(app: Application) -> None:
                         pending_signal    = signal
                         pending_signal_ts = exit_ts
                         await send_tg(app,
-                            f"🔄 *Reentrada buscada* — sesgo {signal.upper()} sigue vigente
-"
+                            f"🔄 *Reentrada buscada* — sesgo {signal.upper()} sigue vigente\n"
                             f"Buscando 1ª vela 15m {'verde 🟢' if signal=='long' else 'roja 🔴'} "
                             f"({tiempo_restante//60}min restantes en vela 4h)"
                         )
