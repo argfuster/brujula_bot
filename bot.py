@@ -138,26 +138,13 @@ def position_is_open(symbol: str) -> bool:
 
 # ─── ÓRDENES STOP ─────────────────────────────────────────────────────────────
 def place_stop_order(symbol: str, direction: str, qty: float, stop_price: float) -> str | None:
-    try:
-        client = get_client()
-        tick   = get_tick_size(symbol)
-        sp     = round_price(stop_price, tick)
-        side   = SIDE_SELL if direction == 'long' else SIDE_BUY
-        decimals = max(0, round(-math.log10(tick)))
-        order  = client.futures_create_order(
-            symbol      = symbol,
-            side        = side,
-            type        = FUTURE_ORDER_TYPE_STOP_MARKET,
-            stopPrice   = f"{sp:.{decimals}f}",
-            quantity    = qty,
-            reduceOnly  = True,
-            workingType = 'MARK_PRICE',
-        )
-        oid = str(order['orderId'])
-        log.info(f"STOP_MARKET colocada: {direction.upper()} stop={sp:.4f} id={oid}")
-        return oid
-    except Exception as e:
-        log.error(f"Error STOP_MARKET: {e}"); return None
+    """
+    Stop gestionado por software en el scan loop.
+    El bot verifica el precio en cada ciclo y cierra con MARKET si se toca el nivel.
+    No se usa STOP_MARKET de Binance (incompatible con testnet, -4120).
+    """
+    log.info(f"Stop software configurado: {direction.upper()} stop={stop_price:.4f}")
+    return None  # stop_id=None indica gestión por software
 
 def cancel_stop_order(symbol: str, order_id: str | None) -> bool:
     if not order_id:
@@ -293,11 +280,13 @@ def update_trail_stop_1h(trade: dict, df1h: pd.DataFrame) -> bool:
     sl_fixed  = trade['sl_fixed']
 
     # Solo usar velas de 1h que:
-    # a) abrieron DESPUÉS de la entrada (entry_ts)
+    # a) abrieron DESPUÉS del momento real de apertura del trade
     # b) ya cerraron (close_time < ahora en ms)
+    # Usamos opened_at (timestamp real) no entry_ts (open vela 15m que puede ser anterior)
+    opened_at_ts = int(trade['opened_at'].timestamp()) if 'opened_at' in trade else entry_ts
     now_ms = int(time.time() * 1000)
     df_c   = df1h[
-        (df1h['open_time'] // 1000 >= entry_ts) &
+        (df1h['open_time'] // 1000 >= opened_at_ts) &
         (df1h['close_time'] < now_ms)
     ].copy()
 
@@ -617,7 +606,33 @@ async def scan_job(app: Application) -> None:
     # ── GESTIÓN DE POSICIÓN ABIERTA ──────────────────────────────────────────
     if active_trade:
 
-        # 1. ¿Binance ejecutó el stop?
+        # 1a. Stop por software: verificar precio actual contra active_stop
+        try:
+            mark = get_mark_price(active_trade['symbol'])
+            active_stop = active_trade.get('active_stop', active_trade['sl_fixed'])
+            direction   = active_trade['direction']
+            sl_tocado   = (
+                (direction == 'long'  and mark <= active_stop) or
+                (direction == 'short' and mark >= active_stop)
+            )
+            if sl_tocado:
+                log.info(f"Stop software tocado: mark={mark:.4f} vs stop={active_stop:.4f} — cerrando con MARKET")
+                reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
+                exit_price = close_position_market(active_trade)
+                if exit_price is None:
+                    exit_price = mark
+                closed_trade = active_trade
+                active_trade = None
+                msg = fmt_close(closed_trade, exit_price, reason)
+                await send_tg(app, msg)
+                pending_signal    = None
+                pending_signal_ts = None
+                log.info("Trade cerrado por stop software — esperando próxima señal 4h")
+                return
+        except Exception as e:
+            log.error(f"Error verificando stop software: {e}")
+
+        # 1b. ¿Binance cerró la posición por otro motivo (liquidación, etc)?
         if not position_is_open(active_trade['symbol']):
             reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
             exit_price = active_trade.get('active_stop', active_trade['sl_fixed'])
