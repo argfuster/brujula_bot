@@ -387,7 +387,9 @@ def open_position(direction: str, entry_price: float, entry_ts: int) -> dict | N
             log.error(f"Datos inválidos: price={price} balance={balance}")
             return None
 
-        notional = balance * (CAPITAL_PCT / 100) * lev_usado
+        # Usar 95% del balance disponible como margen de seguridad para fees/funding
+        capital_usado = balance * (CAPITAL_PCT / 100) * 0.95
+        notional = capital_usado * lev_usado
         qty      = notional / price
         qty      = qty - (qty % step)
         qty      = round(qty, 8)
@@ -702,15 +704,18 @@ async def scan_job(app: Application) -> None:
                         entry_ts = int(row['open_time']) // 1000; break
 
                 dir_ = pending_signal
-                pending_signal    = None
-                pending_signal_ts = None
 
                 trade = open_position(dir_, entry_price, entry_ts)
                 if trade:
-                    active_trade = trade
+                    active_trade      = trade
+                    pending_signal    = None
+                    pending_signal_ts = None
                     await send_tg(app, fmt_open(trade))
                 else:
-                    log.error("Fallo en apertura")
+                    log.error("Fallo en apertura — reintentará en próximo scan")
+                    # No resetear pending_signal para reintentar
+                    # Resetear last_4h_candle para que re-evalúe si es necesario
+                    last_4h_candle = None
             elif expired:
                 log.info(f"Señal {pending_signal.upper()} expirada")
                 pending_signal    = None
