@@ -706,6 +706,14 @@ async def scan_job(app: Application) -> None:
             log.error(f"Error buscando confirmación 15m: {e}")
         return
 
+    # ── FILTRO SESIÓN ASIÁTICA (00:00–08:00 UTC) ──────────────────────────────
+    # No abre nuevas posiciones en sesión asiática.
+    # El trailing y SL de posiciones ya abiertas siguen activos (bloque superior).
+    hora_utc = datetime.now(timezone.utc).hour
+    if 0 <= hora_utc < 8:
+        log.info(f"Sesión asiática ({hora_utc:02d}:xx UTC) — sin nuevas entradas")
+        return
+
     # ── DETECTAR SEÑAL EN 4H (solo en vela nueva) ────────────────────────────
     try:
         df4h = get_klines(SYMBOL, '4h', limit=100)
