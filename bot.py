@@ -280,8 +280,9 @@ def update_trail_stop_1h(trade: dict, df1h: pd.DataFrame) -> bool:
     sl_fixed  = trade['sl_fixed']
 
     # Solo usar velas de 1h que:
-    # a) cerraron DESPUÉS del momento real de apertura del trade (incluye velas que abrieron antes pero cerraron después)
+    # a) abrieron DESPUÉS del momento real de apertura del trade
     # b) ya cerraron (close_time < ahora en ms)
+    # Usamos opened_at (timestamp real) no entry_ts (open vela 15m que puede ser anterior)
     opened_at_ts = int(trade['opened_at'].timestamp()) if 'opened_at' in trade else entry_ts
     now_ms = int(time.time() * 1000)
     df_c   = df1h[
