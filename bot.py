@@ -528,7 +528,11 @@ async def send_tg(app: Application, text: str) -> None:
             chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='Markdown'
         )
     except Exception as e:
-        log.error(f"Telegram: {e}")
+        log.error(f"Telegram Markdown error: {e} — reintentando sin formato")
+        try:
+            await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        except Exception as e2:
+            log.error(f"Telegram: {e2}")
 
 # ─── COMANDOS ─────────────────────────────────────────────────────────────────
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
