@@ -282,7 +282,6 @@ def update_trail_stop_1h(trade: dict, df1h: pd.DataFrame) -> bool:
     # Solo usar velas de 1h que:
     # a) cerraron DESPUÉS del momento real de apertura del trade (incluye velas que abrieron antes pero cerraron después)
     # b) ya cerraron (close_time < ahora en ms)
-    # Usamos opened_at (timestamp real) no entry_ts (open vela 15m que puede ser anterior)
     opened_at_ts = int(trade['opened_at'].timestamp()) if 'opened_at' in trade else entry_ts
     now_ms = int(time.time() * 1000)
     df_c   = df1h[
@@ -590,13 +589,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     env = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
     msg = (
         f"🤖 *Brújula Bot v2* {env}\n\n"
-        f"/status - posición activa + trailing\n"
-        f"/close  - cerrar manualmente\n"
-        f"/help   - este mensaje\n\n"
+        f"/status — posición activa + trailing\n"
+        f"/close  — cerrar manualmente\n"
+        f"/help   — este mensaje\n\n"
         f"*Modelo:* EMA`{EMA_PERIOD}` · ADX`{ADX_MIN}` · 4h\n"
-        f"*Entrada:* 1ª vela 15m verde/roja -> close\n"
+        f"*Entrada:* 1ª vela 15m verde/roja → close\n"
         f"*Stop:* SL`{SL_PCT}%` fijo + trail`{TRAIL_PCT}%` del swing (1h)\n"
-        f"`{SYMBOL}` · `{LEVERAGE}x` · Capital`{CAPITAL_PCT}%`\n"
+        f"`{SYMBOL}` · `{LEVERAGE}×` · Capital`{CAPITAL_PCT}%`\n"
         f"Scan cada `{SCAN_INTERVAL}s`"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -664,7 +663,7 @@ async def scan_job(app: Application) -> None:
                 if actualizado:
                     trail = active_trade['trail_stop']
                     await send_tg(app,
-                        f"📈 *Trail actualizado* - {active_trade['direction'].upper()} `{SYMBOL}`\n"
+                        f"📈 *Trail actualizado* — {active_trade['direction'].upper()} `{SYMBOL}`\n"
                         f"Nuevo stop: `{trail:,.4f}`\n"
                         f"Swing: `{active_trade['best_swing']:,.4f}`\n"
                         f"Stop ID: `{active_trade.get('stop_order_id','N/A')}`"
@@ -772,12 +771,12 @@ async def post_init(app: Application) -> None:
         parse_mode='Markdown',
         text=(
             f"🤖 *Brújula Bot v2* {'🧪 TESTNET' if USE_TESTNET else '🔴 REAL'}\n\n"
-            f"*Señal:* `4h` - EMA`{EMA_PERIOD}` · ADX`{ADX_MIN}`\n"
-            f"*Entrada:* 1ª vela `15m` verde/roja -> close\n"
+            f"*Señal:* `4h` — EMA`{EMA_PERIOD}` · ADX`{ADX_MIN}`\n"
+            f"*Entrada:* 1ª vela `15m` verde/roja → close\n"
             f"*Stop:* `STOP_MARKET` Binance\n"
-            f"  SL fijo `{SL_PCT}%` -> inmediato al abrir\n"
-            f"  Trail `{TRAIL_PCT}%` del swing -> actualiza por cierre 1h\n"
-            f"*Par:* `{SYMBOL}` · *Lev:* `{LEVERAGE}x` · *Capital:* `{CAPITAL_PCT}%`\n"
+            f"  SL fijo `{SL_PCT}%` → inmediato al abrir\n"
+            f"  Trail `{TRAIL_PCT}%` del swing → actualiza por cierre 1h\n"
+            f"*Par:* `{SYMBOL}` · *Lev:* `{LEVERAGE}×` · *Capital:* `{CAPITAL_PCT}%`\n"
             f"*Scan:* cada `{SCAN_INTERVAL}s`\n\n"
             f"_/help para comandos_"
         )
