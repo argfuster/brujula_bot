@@ -39,7 +39,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-# ─── CONFIG ───────────────────────────────────────────────────────────────────
+# ─── CONFIG ─────────────check────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID  = os.environ.get('TELEGRAM_CHAT_ID', '')
 BINANCE_KEY       = os.environ.get('BINANCE_API_KEY', '')
