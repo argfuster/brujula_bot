@@ -523,6 +523,7 @@ def fmt_close(trade: dict, exit_price: float, reason: str) -> str:
     )
 
 async def send_tg(app: Application, text: str) -> None:
+    # Intenta con Markdown; si falla por parseo, reintenta sin formato
     try:
         await app.bot.send_message(
             chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='Markdown'
@@ -530,9 +531,11 @@ async def send_tg(app: Application, text: str) -> None:
     except Exception as e:
         log.error(f"Telegram Markdown error: {e} — reintentando sin formato")
         try:
-            await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            # Limpiar asteriscos y backticks para texto plano
+            plain = text.replace('*', '').replace('`', '')
+            await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=plain)
         except Exception as e2:
-            log.error(f"Telegram: {e2}")
+            log.error(f"Telegram fallback error: {e2}")
 
 # ─── COMANDOS ─────────────────────────────────────────────────────────────────
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
