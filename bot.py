@@ -39,7 +39,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__)
 
-# ─── CONFIG ─────────────check────────────────────────────────────────────────────
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN    = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 TELEGRAM_CHAT_ID  = os.environ.get('TELEGRAM_CHAT_ID', '')
 BINANCE_KEY       = os.environ.get('BINANCE_API_KEY', '')
@@ -139,12 +139,27 @@ def position_is_open(symbol: str) -> bool:
 # ─── ÓRDENES STOP ─────────────────────────────────────────────────────────────
 def place_stop_order(symbol: str, direction: str, qty: float, stop_price: float) -> str | None:
     """
-    Stop gestionado por software en el scan loop.
-    El bot verifica el precio en cada ciclo y cierra con MARKET si se toca el nivel.
-    No se usa STOP_MARKET de Binance (incompatible con testnet, -4120).
+    Coloca una STOP_MARKET real en Binance Futures.
+    Si el bot se cae, Binance ejecuta el stop de todas formas.
+    Retorna el order_id para cancelarla cuando el trail mejora.
     """
-    log.info(f"Stop software configurado: {direction.upper()} stop={stop_price:.4f}")
-    return None  # stop_id=None indica gestión por software
+    try:
+        side = SIDE_SELL if direction == 'long' else SIDE_BUY
+        order = get_client().futures_create_order(
+            symbol=symbol,
+            side=side,
+            type=FUTURE_ORDER_TYPE_STOP_MARKET,
+            quantity=qty,
+            stopPrice=round(stop_price, 2),
+            reduceOnly=True,
+            workingType='MARK_PRICE',
+        )
+        order_id = str(order['orderId'])
+        log.info(f"STOP_MARKET colocada: {direction.upper()} stop={stop_price:.4f} id={order_id}")
+        return order_id
+    except Exception as e:
+        log.error(f"Error colocando STOP_MARKET: {e} — fallback a stop software")
+        return None
 
 def cancel_stop_order(symbol: str, order_id: str | None) -> bool:
     if not order_id:
@@ -616,33 +631,35 @@ async def scan_job(app: Application) -> None:
     # ── GESTIÓN DE POSICIÓN ABIERTA ──────────────────────────────────────────
     if active_trade:
 
-        # 1a. Stop por software: verificar precio actual contra active_stop
-        try:
-            mark = get_mark_price(active_trade['symbol'])
-            active_stop = active_trade.get('active_stop', active_trade['sl_fixed'])
-            direction   = active_trade['direction']
-            sl_tocado   = (
-                (direction == 'long'  and mark <= active_stop) or
-                (direction == 'short' and mark >= active_stop)
-            )
-            if sl_tocado:
-                log.info(f"Stop software tocado: mark={mark:.4f} vs stop={active_stop:.4f} — cerrando con MARKET")
-                reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
-                exit_price = close_position_market(active_trade)
-                if exit_price is None:
-                    exit_price = mark
-                closed_trade = active_trade
-                active_trade = None
-                msg = fmt_close(closed_trade, exit_price, reason)
-                await send_tg(app, msg)
-                pending_signal    = None
-                pending_signal_ts = None
-                log.info("Trade cerrado por stop software — esperando próxima señal 4h")
-                return
-        except Exception as e:
-            log.error(f"Error verificando stop software: {e}")
+        # 1a. Stop software como RESPALDO: solo actúa si place_stop_order falló (stop_order_id=None)
+        # En producción, Binance gestiona el stop con STOP_MARKET real.
+        if not active_trade.get('stop_order_id'):
+            try:
+                mark = get_mark_price(active_trade['symbol'])
+                active_stop = active_trade.get('active_stop', active_trade['sl_fixed'])
+                direction   = active_trade['direction']
+                sl_tocado   = (
+                    (direction == 'long'  and mark <= active_stop) or
+                    (direction == 'short' and mark >= active_stop)
+                )
+                if sl_tocado:
+                    log.info(f"Stop software (respaldo) tocado: mark={mark:.4f} vs stop={active_stop:.4f} — cerrando con MARKET")
+                    reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
+                    exit_price = close_position_market(active_trade)
+                    if exit_price is None:
+                        exit_price = mark
+                    closed_trade = active_trade
+                    active_trade = None
+                    msg = fmt_close(closed_trade, exit_price, reason)
+                    await send_tg(app, msg)
+                    pending_signal    = None
+                    pending_signal_ts = None
+                    log.info("Trade cerrado por stop software (respaldo) — esperando próxima señal 4h")
+                    return
+            except Exception as e:
+                log.error(f"Error verificando stop software (respaldo): {e}")
 
-        # 1b. ¿Binance cerró la posición por otro motivo (liquidación, etc)?
+        # 1b. ¿Binance cerró la posición? (STOP_MARKET ejecutada, liquidación, etc)
         if not position_is_open(active_trade['symbol']):
             reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
             exit_price = active_trade.get('active_stop', active_trade['sl_fixed'])
