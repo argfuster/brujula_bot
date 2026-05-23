@@ -85,10 +85,8 @@ def get_klines(symbol: str, interval: str, limit: int = 200) -> pd.DataFrame:
     return df
 
 def get_mark_price(symbol: str) -> float:
-    try:
-        return float(get_client().futures_mark_price(symbol=symbol)['markPrice'])
-    except Exception as e:
-        log.error(f"Error mark price: {e}"); return 0.0
+    """Lanza excepción si falla — nunca retornar 0 para evitar falsos stops."""
+    return float(get_client().futures_mark_price(symbol=symbol)['markPrice'])
 
 def get_balance() -> float:
     try:
@@ -156,7 +154,7 @@ def place_stop_order(symbol: str, direction: str, qty: float, stop_price: float)
         params = {
             "symbol":        symbol,
             "side":          side,
-            "orderType":     "STOP_MARKET",
+            "type":          "STOP_MARKET",
             "algoType":      "CONDITIONAL",
             "quantity":      str(qty),
             "triggerPrice":  f"{stop_price:.2f}",
