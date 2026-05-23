@@ -26,7 +26,8 @@ Variables Railway:
   SCAN_INTERVAL     (60)   ← cada 1 minuto para detectar nuevas velas de 1h
 """
 
-import os, time, logging, math
+import os, time, logging, math, hmac, hashlib, urllib.parse
+import requests as req_lib
 from datetime import datetime, timezone
 
 import numpy as np
@@ -139,37 +140,73 @@ def position_is_open(symbol: str) -> bool:
 # ─── ÓRDENES STOP ─────────────────────────────────────────────────────────────
 def place_stop_order(symbol: str, direction: str, qty: float, stop_price: float) -> str | None:
     """
-    Coloca una STOP_MARKET real en Binance Futures.
-    Si el bot se cae, Binance ejecuta el stop de todas formas.
-    Retorna el order_id para cancelarla cuando el trail mejora.
+    Coloca una STOP_MARKET condicional usando el nuevo endpoint Algo de Binance.
+    Desde 2025-12-09 Binance requiere POST /fapi/v1/algoOrder para órdenes condicionales.
+    En testnet (USE_TESTNET=true) usa stop software como fallback.
     """
+    if USE_TESTNET:
+        log.info(f"Testnet: stop software configurado {direction.upper()} stop={stop_price:.4f}")
+        return None
+
     try:
-        side = SIDE_SELL if direction == 'long' else SIDE_BUY
-        order = get_client().futures_create_order(
-            symbol=symbol,
-            side=side,
-            type=FUTURE_ORDER_TYPE_STOP_MARKET,
-            quantity=qty,
-            stopPrice=round(stop_price, 2),
-            reduceOnly=True,
-            workingType='MARK_PRICE',
-        )
-        order_id = str(order['orderId'])
-        log.info(f"STOP_MARKET colocada: {direction.upper()} stop={stop_price:.4f} id={order_id}")
-        return order_id
+        base_url = "https://fapi.binance.com"
+        endpoint = "/fapi/v1/algoOrder"
+        side = "SELL" if direction == "long" else "BUY"
+        ts = int(time.time() * 1000)
+        params = {
+            "symbol":        symbol,
+            "side":          side,
+            "orderType":     "STOP_MARKET",
+            "algoType":      "CONDITIONAL",
+            "quantity":      str(qty),
+            "triggerPrice":  f"{stop_price:.2f}",
+            "reduceOnly":    "true",
+            "workingType":   "MARK_PRICE",
+            "timestamp":     ts,
+        }
+        query = urllib.parse.urlencode(params)
+        sig = hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        headers = {"X-MBX-APIKEY": BINANCE_KEY}
+        r = req_lib.post(f"{base_url}{endpoint}", params=params, headers=headers, timeout=10)
+        data = r.json()
+        if "algoId" in data:
+            algo_id = str(data["algoId"])
+            log.info(f"STOP_MARKET algo colocada: {direction.upper()} stop={stop_price:.4f} algoId={algo_id}")
+            return algo_id
+        else:
+            log.error(f"Error colocando algo stop: {data} — fallback a stop software")
+            return None
     except Exception as e:
-        log.error(f"Error colocando STOP_MARKET: {e} — fallback a stop software")
+        log.error(f"Error colocando STOP_MARKET algo: {e} — fallback a stop software")
         return None
 
 def cancel_stop_order(symbol: str, order_id: str | None) -> bool:
     if not order_id:
         return True
+    if USE_TESTNET:
+        return True
     try:
+        # Intentar cancelar como algo order primero
+        base_url = "https://fapi.binance.com"
+        ts = int(time.time() * 1000)
+        params = {"algoId": int(order_id), "timestamp": ts}
+        query = urllib.parse.urlencode(params)
+        sig = hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        headers = {"X-MBX-APIKEY": BINANCE_KEY}
+        r = req_lib.delete(f"{base_url}/fapi/v1/algoOrder", params=params, headers=headers, timeout=10)
+        data = r.json()
+        if data.get("algoId") or data.get("code") == 200:
+            log.info(f"Algo order {order_id} cancelada")
+            return True
+        # Si falla, intentar como orden normal
         get_client().futures_cancel_order(symbol=symbol, orderId=int(order_id))
         log.info(f"Orden {order_id} cancelada")
         return True
     except Exception as e:
-        log.warning(f"Cancel {order_id}: {e}"); return False
+        log.warning(f"Cancel {order_id}: {e}")
+        return False
 
 # ─── INDICADORES ──────────────────────────────────────────────────────────────
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
