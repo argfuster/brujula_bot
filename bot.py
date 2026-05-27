@@ -655,9 +655,10 @@ def main() -> None:
                 )
             except: pass
 
+        loop = asyncio.get_event_loop()
         scheduler = AsyncIOScheduler()
         scheduler.add_job(
-            lambda: asyncio.ensure_future(scan(app)),
+            lambda: asyncio.run_coroutine_threadsafe(scan(app), loop),
             'interval', seconds=SCAN_INTERVAL,
             id='scan', replace_existing=True
         )
