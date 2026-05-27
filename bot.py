@@ -638,20 +638,20 @@ def main() -> None:
                 chat_id=TELEGRAM_CHAT_ID,
                 text=(
                     f"🤖 *Brújula Bot EMA15m* {env}\n\n"
-                    f"Señal: 15m — EMA{EMA_PERIOD} \\+ ADX{ADX_PERIOD}>={ADX_MIN}\n"
+                    f"Señal: 15m — EMA{EMA_PERIOD} + ADX{ADX_PERIOD} >= {ADX_MIN}\n"
                     f"Entrada: open de la vela siguiente\n"
-                    f"Stop: SL {SL_PCT}% fijo \\+ Trail {TRAIL_PCT}% swing 15m\n"
-                    f"Par: {SYMBOL} · Lev: {LEVERAGE}× · Capital: {CAPITAL_PCT}%\n"
+                    f"Stop: SL {SL_PCT}% fijo + Trail {TRAIL_PCT}% swing 15m\n"
+                    f"Par: {SYMBOL} | Lev: {LEVERAGE}x | Capital: {CAPITAL_PCT}%\n"
                     f"Scan: cada {SCAN_INTERVAL}s"
                 ),
-                parse_mode='MarkdownV2'
+                parse_mode='Markdown'
             )
         except Exception as e:
             log.error(f"Error mensaje inicio: {e}")
             try:
                 await app.bot.send_message(
                     chat_id=TELEGRAM_CHAT_ID,
-                    text=f"Brújula Bot EMA15m arrancando — {env}"
+                    text=f"Brújula Bot EMA15m arrancando — {'TESTNET' if USE_TESTNET else 'REAL'}"
                 )
             except: pass
 
