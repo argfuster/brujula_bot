@@ -177,7 +177,8 @@ def check_signal_orb(df15: pd.DataFrame, session: str) -> tuple[str|None, float,
     hoy_et      = today_et()       # 'YYYY-MM-DD' en ET
 
     for _, row in closed.iterrows():
-        ts = int(row['open_time'])
+        ts_ms = int(row['open_time'])
+        ts    = ts_ms // 1000          # Binance devuelve ms → convertir a segundos
         if not is_orb_fn(ts):
             continue
 
@@ -195,10 +196,9 @@ def check_signal_orb(df15: pd.DataFrame, session: str) -> tuple[str|None, float,
         elif c < o:
             direction = 'short'
         else:
-            # Doji exacto (close==open) — usar sesgo del range
             direction = 'long' if (h - c) < (c - l) else 'short'
-        sl_price  = l if direction == 'long' else h
-        return direction, c, sl_price, ts
+        sl_price = l if direction == 'long' else h
+        return direction, c, sl_price, ts   # ts en segundos
 
     return None, 0.0, 0.0, 0
 
@@ -650,7 +650,7 @@ def main() -> None:
         loop = asyncio.get_event_loop()
         scheduler = AsyncIOScheduler()
         scheduler.add_job(
-            lambda: asyncio.run_coroutine_threadsafe(scan(app), loop),
+            lambda: loop.create_task(scan(app)),
             'interval', seconds=SCAN_INTERVAL,
             id='scan', replace_existing=True
         )
