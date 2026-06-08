@@ -187,6 +187,15 @@ def check_signal_orb(df15: pd.DataFrame, session: str) -> tuple[str|None, float,
         orb_offset = -4 if is_edt(orb_dt) else -5
         orb_et     = (orb_dt + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
         if orb_et != hoy_et:
+            return None, 0.0, 0.0, 0
+
+        # Verificar que la vela ORB cerró hace menos de 2 velas (30 min máximo)
+        # Evita entrar horas después al precio actual en lugar del close ORB
+        now_ts = int(utc_now().timestamp())
+        orb_close_ts = ts + 15 * 60  # la vela de 15m cierra 15 min después del open
+        mins_elapsed = (now_ts - orb_close_ts) / 60
+        if mins_elapsed > 30:
+            log.info(f"Vela ORB de {session.upper()} tiene {mins_elapsed:.0f} min — demasiado tarde para entrar")
             return None, 0.0, 0.0, 0  # vela ORB de otro día — no aplica
 
         # Vela ORB de hoy encontrada — sin filtro doji
@@ -255,6 +264,7 @@ def open_position(symbol: str, direction: str, sl_price: float, session: str) ->
         step     = get_step_size(symbol)
         notional = balance * (CAPITAL_PCT / 100) * LEVERAGE
         qty      = round_qty(notional / mark, step)
+        log.info(f"open_position: balance={balance:.2f} mark={mark:.4f} notional={notional:.2f} qty={qty} lev={LEVERAGE}x")
 
         if qty <= 0:
             log.error("Qty = 0, no abre")
@@ -586,6 +596,8 @@ async def scan(app: Application) -> None:
                             active_trade         = trade
                             traded_london_today  = hoy
                             await send_tg(app, fmt_open(trade, get_balance()))
+                        else:
+                            traded_london_today = hoy  # evitar reintentos aunque falle
 
         # ── 2b. SEÑAL NY (9:30 ET, cierra 15:00 ET con T70%)
         ny_open_utc  = 13.5 if is_edt(now_utc) else 14.5  # 9:30 ET en UTC
@@ -604,6 +616,8 @@ async def scan(app: Application) -> None:
                         active_trade    = trade
                         traded_ny_today = hoy
                         await send_tg(app, fmt_open(trade, get_balance()))
+                    else:
+                        traded_ny_today = hoy  # evitar reintentos aunque falle
 
     except Exception as e:
         log.error(f"Error en scan: {e}")
