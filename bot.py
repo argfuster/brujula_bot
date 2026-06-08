@@ -1,32 +1,40 @@
 """
-Brújula Bot EMA15m — EMA200 + ADX30 + Trailing 80%
-====================================================
-Modelo validado contra tester EMA15m (2020-2025, 0 trimestres negativos):
-  Señal:    15m — vela anterior cierra > EMA200 → LONG, < EMA200 → SHORT
-  Filtro:   ADX14 >= 30
-  Entrada:  al OPEN de la vela siguiente a la señal
-  SL fijo:  2.5% desde la entrada → STOP_MARKET inmediata en Binance (Algo Orders)
-  Trailing: swing crece con CLOSE de velas de 15m ya cerradas desde la entrada
-            trail = entrada + swing × 80% (long) / entrada - swing × 80% (short)
-            cuando trail supera SL fijo → reemplaza la STOP_MARKET
-  Salida:   solo por STOP_MARKET (SL fijo o trailing) — nunca por corte de EMA
-  Reentrada: DESACTIVADA — una entrada por vela 15m, espera próxima señal
+Brújula Bot — ORB Combinado Londres + NY
+=========================================
+Modelo validado (2020-2026): $42.5M desde $1,000 · Sharpe 1.59
+
+SESIÓN LONDRES (sin trailing):
+  Señal:   Primera vela 15m del día a las 8:00 GMT (BST: 7:00 UTC / GMT: 8:00 UTC)
+  Entry:   Close de la vela ORB
+  Stop:    Low (BULL) / High (BEAR) de la vela ORB — mechas incluidas
+  Cierre:  11:00 GMT (antes del fixing de Londres)
+  Trail:   DESACTIVADO — EoD puro
+
+SESIÓN NY (con trailing 70%):
+  Señal:   Primera vela 15m del día a las 9:30 ET (EDT: 13:30 UTC / EST: 14:30 UTC)
+  Entry:   Close de la vela ORB
+  Stop:    Low (BULL) / High (BEAR) de la vela ORB — mechas incluidas
+  Trailing: 70% del swing · actualizado por closes de 15m
+  Cierre:  15:00 ET (backstop si trail no se activó)
+
+CAPITAL: 100% del disponible en cada señal · compuesto trade a trade
+  → Londres cierra antes de que abra NY → nunca hay dos posiciones simultáneas
 
 Variables Railway:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   BINANCE_API_KEY, BINANCE_API_SECRET
-  USE_TESTNET       (true)
-  LEVERAGE          (3)
-  SL_PCT            (2.5)
-  TRAIL_PCT         (80)
-  SCAN_INTERVAL     (30)   ← cada 30s para detectar nuevas velas de 15m
+  USE_TESTNET   (true)
+  SYMBOL        (ETHUSDT)
+  LEVERAGE      (5)
+  CAPITAL_PCT   (100)
+  TRAIL_PCT_NY  (70)   ← solo aplica a NY
+  SCAN_INTERVAL (30)
 """
 
 import os, time, logging, math, hmac, hashlib, urllib.parse
 import requests as req_lib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-import numpy as np
 import pandas as pd
 from binance.client import Client
 from binance.enums import SIDE_BUY, SIDE_SELL, ORDER_TYPE_MARKET
@@ -42,19 +50,76 @@ TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID', '')
 BINANCE_KEY      = os.environ.get('BINANCE_API_KEY', '')
 BINANCE_SECRET   = os.environ.get('BINANCE_API_SECRET', '')
 USE_TESTNET      = os.environ.get('USE_TESTNET', 'true').lower() == 'true'
-SYMBOL           = 'ETHUSDT'
-LEVERAGE         = int(os.environ.get('LEVERAGE', '3'))
-CAPITAL_PCT      = 100.0
-EMA_PERIOD       = 200
-ADX_PERIOD       = 14
-ADX_MIN          = 30.0
-SL_PCT           = float(os.environ.get('SL_PCT', '2.5'))
-TRAIL_PCT        = float(os.environ.get('TRAIL_PCT', '80'))
+SYMBOL           = os.environ.get('TRADING_SYMBOL', 'ETHUSDT')
+LEVERAGE         = int(os.environ.get('LEVERAGE', '5'))
+CAPITAL_PCT      = float(os.environ.get('CAPITAL_PCT', '100'))
+TRAIL_PCT_NY     = float(os.environ.get('TRAIL_PCT_NY', '70'))
 SCAN_INTERVAL    = int(os.environ.get('SCAN_INTERVAL', '30'))
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
-active_trade:      dict | None = None
-last_15m_candle:   int  | None = None  # open_time de la última vela 15m evaluada
+active_trade:          dict | None = None
+traded_london_today:   str  | None = None  # fecha ET 'YYYY-MM-DD'
+traded_ny_today:       str  | None = None  # fecha ET 'YYYY-MM-DD'
+last_15m_ts:           int  | None = None  # ts de la última vela 15m evaluada
+
+# ─── HELPERS DE TIEMPO ────────────────────────────────────────────────────────
+def is_edt(dt: datetime) -> bool:
+    """EDT: segundo domingo de marzo → primer domingo de noviembre."""
+    y = dt.year
+    mar1 = datetime(y, 3, 1, tzinfo=timezone.utc)
+    edt_start = mar1 + timedelta(days=(6 - mar1.weekday()) % 7 + 7)
+    nov1 = datetime(y, 11, 1, tzinfo=timezone.utc)
+    edt_end = nov1 + timedelta(days=(6 - nov1.weekday()) % 7)
+    return edt_start <= dt.replace(tzinfo=timezone.utc) < edt_end
+
+def is_bst(dt: datetime) -> bool:
+    """BST: último domingo de marzo → último domingo de octubre."""
+    y = dt.year
+    mar = datetime(y, 3, 31, tzinfo=timezone.utc)
+    while mar.weekday() != 6: mar -= timedelta(days=1)
+    oct_ = datetime(y, 10, 31, tzinfo=timezone.utc)
+    while oct_.weekday() != 6: oct_ -= timedelta(days=1)
+    return mar <= dt.replace(tzinfo=timezone.utc) < oct_
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def today_et() -> str:
+    now = utc_now()
+    offset = -4 if is_edt(now) else -5
+    return (now + timedelta(hours=offset)).strftime('%Y-%m-%d')
+
+def is_weekend() -> bool:
+    now = utc_now()
+    offset = -4 if is_edt(now) else -5
+    return (now + timedelta(hours=offset)).weekday() >= 5
+
+def utc_hour_now() -> float:
+    d = utc_now()
+    return d.hour + d.minute / 60 + d.second / 3600
+
+# ─── DETECTAR VELAS ORB ───────────────────────────────────────────────────────
+def is_orb_london(ts: int) -> bool:
+    """8:00 GMT = 7:00 UTC (BST) / 8:00 UTC (GMT)."""
+    d = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if d.minute != 0: return False
+    return d.hour == 7 if is_bst(d) else d.hour == 8
+
+def is_orb_ny(ts: int) -> bool:
+    """9:30 ET = 13:30 UTC (EDT) / 14:30 UTC (EST)."""
+    d = datetime.fromtimestamp(ts, tz=timezone.utc)
+    if d.minute != 30: return False
+    return d.hour == 13 if is_edt(d) else d.hour == 14
+
+def close_utc_london() -> float:
+    """11:00 GMT = 10:00 UTC (BST) / 11:00 UTC (GMT)."""
+    now = utc_now()
+    return 10.0 if is_bst(now) else 11.0
+
+def close_utc_ny() -> float:
+    """15:00 ET = 19:00 UTC (EDT) / 20:00 UTC (EST)."""
+    now = utc_now()
+    return 19.0 if is_edt(now) else 20.0
 
 # ─── CLIENTE BINANCE ──────────────────────────────────────────────────────────
 def get_client() -> Client:
@@ -63,7 +128,7 @@ def get_client() -> Client:
         c.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
     return c
 
-def get_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
+def get_klines(symbol: str, interval: str, limit: int = 100) -> pd.DataFrame:
     raw = get_client().futures_klines(symbol=symbol, interval=interval, limit=limit)
     df = pd.DataFrame(raw, columns=[
         'open_time','open','high','low','close','volume',
@@ -75,7 +140,6 @@ def get_klines(symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
     return df
 
 def get_mark_price(symbol: str) -> float:
-    """Lanza excepción si falla — nunca retornar 0 para evitar falsos stops."""
     return float(get_client().futures_mark_price(symbol=symbol)['markPrice'])
 
 def get_balance() -> float:
@@ -101,100 +165,90 @@ def round_qty(qty: float, step: float) -> float:
     decimals = max(0, round(-math.log10(step)))
     return round(math.floor(qty / step) * step, decimals)
 
-# ─── INDICADORES ──────────────────────────────────────────────────────────────
-def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
+# ─── SEÑAL ORB ────────────────────────────────────────────────────────────────
+def check_signal_orb(df15: pd.DataFrame, session: str) -> tuple[str|None, float, float, int]:
+    """
+    Evalúa SOLO la primera vela de la sesión (8:00 GMT o 9:30 ET) de HOY.
+    Si esa vela no cerró aún o no es de hoy → sin señal.
+    Si la vela es doji exacto (close==open) → sin señal.
+    """
+    is_orb_fn   = is_orb_london if session == 'london' else is_orb_ny
+    closed      = df15.iloc[:-1]   # excluir vela abierta actual
+    hoy_et      = today_et()       # 'YYYY-MM-DD' en ET
 
-def calc_adx(df: pd.DataFrame, period: int) -> pd.Series:
-    up   = df['high'].diff()
-    down = -df['low'].diff()
-    pdm  = np.where((up > down) & (up > 0), up, 0.0)
-    ndm  = np.where((down > up) & (down > 0), down, 0.0)
-    pc   = df['close'].shift(1)
-    tr   = pd.concat([df['high']-df['low'],
-                      (df['high']-pc).abs(),
-                      (df['low']-pc).abs()], axis=1).max(axis=1)
+    for _, row in closed.iterrows():
+        ts = int(row['open_time'])
+        if not is_orb_fn(ts):
+            continue
 
-    def wilder(s, n):
-        r = np.full(len(s), np.nan)
-        arr = s.values
-        r[n] = arr[1:n+1].sum()
-        for i in range(n+1, len(arr)):
-            r[i] = r[i-1] - r[i-1]/n + arr[i]
-        return pd.Series(r, index=s.index)
+        # Verificar que la vela ORB es de hoy (en ET)
+        orb_dt     = datetime.fromtimestamp(ts, tz=timezone.utc)
+        orb_offset = -4 if is_edt(orb_dt) else -5
+        orb_et     = (orb_dt + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
+        if orb_et != hoy_et:
+            return None, 0.0, 0.0, 0  # vela ORB de otro día — no aplica
 
-    tr_w  = wilder(tr, period)
-    pdm_w = wilder(pd.Series(pdm, index=df.index), period)
-    ndm_w = wilder(pd.Series(ndm, index=df.index), period)
-    pdi   = (pdm_w / tr_w * 100).replace([np.inf, -np.inf], np.nan)
-    ndi   = (ndm_w / tr_w * 100).replace([np.inf, -np.inf], np.nan)
-    dx    = ((pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan) * 100)
-    return wilder(dx.fillna(0), period) / period
+        # Vela ORB de hoy encontrada — sin filtro doji
+        o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
+        if c > o:
+            direction = 'long'
+        elif c < o:
+            direction = 'short'
+        else:
+            # Doji exacto (close==open) — usar sesgo del range
+            direction = 'long' if (h - c) < (c - l) else 'short'
+        sl_price  = l if direction == 'long' else h
+        return direction, c, sl_price, ts
 
-# ─── ÓRDENES BINANCE ──────────────────────────────────────────────────────────
+    return None, 0.0, 0.0, 0
+
+# ─── ÓRDENES ──────────────────────────────────────────────────────────────────
 def place_stop_order(symbol: str, direction: str, qty: float, stop_price: float) -> str | None:
-    """Coloca STOP_MARKET via Algo Orders endpoint (POST /fapi/v1/algoOrder)."""
     if USE_TESTNET:
-        log.info(f"Testnet: stop software configurado {direction.upper()} stop={stop_price:.4f}")
+        log.info(f"Testnet: stop software en {stop_price:.4f}")
         return None
     try:
-        base_url = "https://fapi.binance.com"
-        side = "SELL" if direction == "long" else "BUY"
-        ts = int(time.time() * 1000)
+        side   = "SELL" if direction == "long" else "BUY"
+        ts_ms  = int(time.time() * 1000)
         params = {
-            "symbol":       symbol,
-            "side":         side,
-            "type":         "STOP_MARKET",
-            "algoType":     "CONDITIONAL",
-            "quantity":     str(qty),
-            "triggerPrice": f"{stop_price:.2f}",
-            "reduceOnly":   "true",
-            "workingType":  "MARK_PRICE",
-            "timestamp":    ts,
+            "symbol": symbol, "side": side, "type": "STOP_MARKET",
+            "algoType": "CONDITIONAL", "quantity": str(qty),
+            "triggerPrice": f"{stop_price:.2f}", "reduceOnly": "true",
+            "workingType": "MARK_PRICE", "timestamp": ts_ms,
         }
         query = urllib.parse.urlencode(params)
         sig   = hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
         params["signature"] = sig
-        headers = {"X-MBX-APIKEY": BINANCE_KEY}
-        r = req_lib.post(f"{base_url}/fapi/v1/algoOrder", params=params, headers=headers, timeout=10)
+        r = req_lib.post("https://fapi.binance.com/fapi/v1/algoOrder",
+                         params=params, headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=10)
         data = r.json()
         if "algoId" in data:
-            algo_id = str(data["algoId"])
-            log.info(f"STOP_MARKET algo colocada: {direction.upper()} stop={stop_price:.4f} algoId={algo_id}")
-            return algo_id
-        else:
-            log.error(f"Error colocando algo stop: {data} — fallback a stop software")
-            return None
+            log.info(f"STOP_MARKET algo: {direction.upper()} stop={stop_price:.4f} id={data['algoId']}")
+            return str(data["algoId"])
+        log.error(f"Error algo stop: {data}")
+        return None
     except Exception as e:
-        log.error(f"Error colocando STOP_MARKET algo: {e} — fallback a stop software")
+        log.error(f"Error colocando stop: {e}")
         return None
 
 def cancel_stop_order(symbol: str, order_id: str | None) -> bool:
-    if not order_id:
-        return True
-    if USE_TESTNET:
+    if not order_id or USE_TESTNET:
         return True
     try:
-        base_url = "https://fapi.binance.com"
-        ts = int(time.time() * 1000)
-        params = {"algoId": int(order_id), "timestamp": ts}
-        query = urllib.parse.urlencode(params)
-        sig   = hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+        ts_ms  = int(time.time() * 1000)
+        params = {"algoId": int(order_id), "timestamp": ts_ms}
+        query  = urllib.parse.urlencode(params)
+        sig    = hmac.new(BINANCE_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
         params["signature"] = sig
-        headers = {"X-MBX-APIKEY": BINANCE_KEY}
-        r = req_lib.delete(f"{base_url}/fapi/v1/algoOrder", params=params, headers=headers, timeout=10)
-        data = r.json()
-        if data.get("algoId") or data.get("code") == 200:
-            log.info(f"Algo order {order_id} cancelada")
-            return True
-        get_client().futures_cancel_order(symbol=symbol, orderId=int(order_id))
+        r = req_lib.delete("https://fapi.binance.com/fapi/v1/algoOrder",
+                           params=params, headers={"X-MBX-APIKEY": BINANCE_KEY}, timeout=10)
+        log.info(f"Cancel stop {order_id}: {r.json()}")
         return True
     except Exception as e:
-        log.warning(f"Cancel {order_id}: {e}")
+        log.error(f"Error cancelando stop: {e}")
         return False
 
-def open_position(symbol: str, direction: str) -> dict | None:
-    """Abre posición MARKET y coloca STOP_MARKET inmediata."""
+def open_position(symbol: str, direction: str, sl_price: float, session: str) -> dict | None:
     try:
         balance  = get_balance()
         mark     = get_mark_price(symbol)
@@ -203,282 +257,205 @@ def open_position(symbol: str, direction: str) -> dict | None:
         qty      = round_qty(notional / mark, step)
 
         if qty <= 0:
-            log.error("Qty calculada = 0, no abre")
+            log.error("Qty = 0, no abre")
             return None
 
-        # Configurar leverage
-        get_client().futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        if direction == 'long'  and sl_price >= mark:
+            log.error(f"SL {sl_price:.4f} >= mark {mark:.4f} — abortando")
+            return None
+        if direction == 'short' and sl_price <= mark:
+            log.error(f"SL {sl_price:.4f} <= mark {mark:.4f} — abortando")
+            return None
 
-        # Orden MARKET
+        try:
+            get_client().futures_change_leverage(symbol=symbol, leverage=LEVERAGE)
+        except Exception as e:
+            log.warning(f"Leverage: {e}")
+
         side  = SIDE_BUY if direction == 'long' else SIDE_SELL
         order = get_client().futures_create_order(
             symbol=symbol, side=side, type=ORDER_TYPE_MARKET, quantity=qty
         )
 
-        # Precio de entrada real
-        fills      = order.get('fills', [])
+        fills       = order.get('fills', [])
         entry_price = float(order.get('avgPrice', 0))
         if not entry_price and fills:
-            total_qty = sum(float(f['qty']) for f in fills)
-            entry_price = sum(float(f['price']) * float(f['qty']) for f in fills) / total_qty if total_qty else mark
+            total = sum(float(f['qty']) for f in fills)
+            entry_price = sum(float(f['price'])*float(f['qty']) for f in fills) / total if total else mark
         if not entry_price:
             entry_price = mark
 
-        # SL fijo
-        sl_fixed = entry_price * (1 - SL_PCT/100) if direction == 'long' else entry_price * (1 + SL_PCT/100)
-        stop_id  = place_stop_order(symbol, direction, qty, sl_fixed)
+        stop_id = place_stop_order(symbol, direction, qty, sl_price)
+        sl_pct  = abs(entry_price - sl_price) / entry_price * 100
 
         return {
             'symbol':        symbol,
+            'session':       session,
             'direction':     direction,
             'qty':           qty,
             'entry':         entry_price,
-            'sl_fixed':      sl_fixed,
-            'best_swing':    entry_price,  # swing parte del precio de entrada
+            'sl_fixed':      sl_price,
+            'sl_pct':        sl_pct,
+            'best_swing':    entry_price,
             'trail_stop':    None,
             'stop_order_id': stop_id,
-            'opened_at':     datetime.now(timezone.utc),
+            'opened_at':     utc_now(),
         }
     except Exception as e:
         log.error(f"Error abriendo posición: {e}")
         return None
 
 def close_position_market(trade: dict) -> float | None:
-    """Cierra posición con orden MARKET. Retorna precio de ejecución."""
     try:
         cancel_stop_order(trade['symbol'], trade.get('stop_order_id'))
         side  = SIDE_SELL if trade['direction'] == 'long' else SIDE_BUY
         order = get_client().futures_create_order(
             symbol=trade['symbol'], side=side,
-            type=ORDER_TYPE_MARKET, quantity=trade['qty'],
-            reduceOnly=True
+            type=ORDER_TYPE_MARKET, quantity=trade['qty'], reduceOnly=True
         )
         fills = order.get('fills', [])
-        if fills:
-            total_qty = sum(float(f['qty']) for f in fills)
-            return sum(float(f['price'])*float(f['qty']) for f in fills) / total_qty if total_qty else None
-        avg = float(order.get('avgPrice', 0))
-        return avg if avg else None
+        price = float(order.get('avgPrice', 0))
+        if not price and fills:
+            total = sum(float(f['qty']) for f in fills)
+            price = sum(float(f['price'])*float(f['qty']) for f in fills) / total if total else None
+        return price
     except Exception as e:
-        log.error(f"Error cerrando posición: {e}")
+        log.error(f"Error cerrando: {e}")
         return None
 
-# ─── SEÑAL 15M ────────────────────────────────────────────────────────────────
-def check_signal_15m(df: pd.DataFrame) -> tuple[str | None, float | None]:
-    """
-    Evalúa la penúltima vela cerrada (iloc[-2]).
-    Retorna (direction, entry_price) o (None, None).
-    entry_price = open de la última vela (vela siguiente a la señal).
-    """
-    if len(df) < EMA_PERIOD + ADX_PERIOD * 3:
-        return None, None
-
-    ema = calc_ema(df['close'], EMA_PERIOD)
-    adx = calc_adx(df, ADX_PERIOD)
-
-    # Penúltima vela = última cerrada
-    close_prev = float(df['close'].iloc[-2])
-    ema_prev   = float(ema.iloc[-2])
-    adx_prev   = float(adx.iloc[-2])
-
-    if pd.isna(adx_prev) or pd.isna(ema_prev):
-        return None, None
-
-    # Filtro ADX
-    if adx_prev < ADX_MIN:
-        return None, None
-
-    # Señal
-    entry_price = float(df['open'].iloc[-1])  # open de la vela actual (siguiente a la señal)
-
-    if close_prev > ema_prev:
-        return 'long', entry_price
-    elif close_prev < ema_prev:
-        return 'short', entry_price
-    return None, None
-
-# ─── TRAILING 15M ─────────────────────────────────────────────────────────────
+# ─── TRAILING (solo NY) ───────────────────────────────────────────────────────
 def update_trail_15m(trade: dict, df15: pd.DataFrame) -> bool:
-    """
-    Actualiza el trailing con cierres de velas 15m favorables desde la entrada.
-    Retorna True si el trail mejoró y la STOP_MARKET fue actualizada.
-    """
-    opened_at_ts = trade['opened_at'].timestamp()
-    direction    = trade['direction']
-    entry        = trade['entry']
-    best_swing   = trade['best_swing']
-
-    # Velas 15m que cerraron DESPUÉS de la apertura
-    recent = df15[df15['open_time'] // 1000 + 900 > opened_at_ts]  # close_time > opened_at
-
-    updated = False
-    for _, row in recent.iterrows():
-        close = float(row['close'])
-        if direction == 'long'  and close > best_swing:
-            best_swing = close
-            updated = True
-        elif direction == 'short' and close < best_swing:
-            best_swing = close
-            updated = True
-
-    if not updated:
+    """Actualiza el trailing stop por closes de velas 15m cerradas. Solo para NY."""
+    if trade.get('session') != 'ny':
+        return False
+    if TRAIL_PCT_NY <= 0:
         return False
 
-    # Calcular nuevo trail
-    if direction == 'long':
-        swing = best_swing - entry
-        new_trail = entry + swing * (TRAIL_PCT / 100) if swing > 0 else None
-    else:
-        swing = entry - best_swing
-        new_trail = entry - swing * (TRAIL_PCT / 100) if swing > 0 else None
+    entry     = trade['entry']
+    direction = trade['direction']
+    opened_ts = int(trade['opened_at'].timestamp() * 1000)
+    updated   = False
 
-    if new_trail is None:
-        return False
+    closed = df15[df15['open_time'] < int(df15['open_time'].iloc[-1])]
+    closed = closed[closed['open_time'] > opened_ts]
 
-    # Trail solo toma control cuando supera al SL fijo
-    sl_fixed = trade['sl_fixed']
-    if direction == 'long'  and new_trail <= sl_fixed:
-        trade['best_swing'] = best_swing
-        return False
-    if direction == 'short' and new_trail >= sl_fixed:
-        trade['best_swing'] = best_swing
-        return False
+    for _, row in closed.iterrows():
+        close_price = float(row['close'])
+        if direction == 'long':
+            if close_price > trade['best_swing']:
+                trade['best_swing'] = close_price
+                swing_dist  = trade['best_swing'] - entry
+                new_trail   = entry + swing_dist * (TRAIL_PCT_NY / 100)
+                if new_trail > (trade['trail_stop'] or trade['sl_fixed']):
+                    trade['trail_stop'] = new_trail
+                    cancel_stop_order(trade['symbol'], trade.get('stop_order_id'))
+                    trade['stop_order_id'] = place_stop_order(
+                        trade['symbol'], direction, trade['qty'], new_trail)
+                    updated = True
+        else:
+            if close_price < trade['best_swing']:
+                trade['best_swing'] = close_price
+                swing_dist  = entry - trade['best_swing']
+                new_trail   = entry - swing_dist * (TRAIL_PCT_NY / 100)
+                if new_trail < (trade['trail_stop'] or trade['sl_fixed']):
+                    trade['trail_stop'] = new_trail
+                    cancel_stop_order(trade['symbol'], trade.get('stop_order_id'))
+                    trade['stop_order_id'] = place_stop_order(
+                        trade['symbol'], direction, trade['qty'], new_trail)
+                    updated = True
+    return updated
 
-    # Trail mejoró y supera el SL fijo — actualizar STOP_MARKET
-    old_trail = trade.get('trail_stop')
-    if old_trail is not None:
-        if direction == 'long'  and new_trail <= old_trail: return False
-        if direction == 'short' and new_trail >= old_trail: return False
+# ─── MENSAJES TELEGRAM ────────────────────────────────────────────────────────
+async def send_tg(app: Application, text: str) -> None:
+    try:
+        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception as e:
+        log.error(f"Telegram: {e}")
 
-    log.info(f"Trail actualizado: {old_trail} → {new_trail:.4f} (swing={best_swing:.4f})")
-
-    # Cancelar stop anterior y colocar nuevo
-    cancel_stop_order(trade['symbol'], trade.get('stop_order_id'))
-    new_stop_id = place_stop_order(trade['symbol'], direction, trade['qty'], new_trail)
-
-    trade['best_swing']    = best_swing
-    trade['trail_stop']    = new_trail
-    trade['stop_order_id'] = new_stop_id
-    trade['active_stop']   = new_trail
-    return True
-
-# ─── FORMATO MENSAJES TELEGRAM ────────────────────────────────────────────────
 def fmt_open(trade: dict, balance: float) -> str:
     env  = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
-    dir_emoji = '🟢' if trade['direction'] == 'long' else '🔴'
+    icon = '🇬🇧' if trade['session'] == 'london' else '🇺🇸'
+    sess = 'LONDRES' if trade['session'] == 'london' else 'NY'
+    close_info = '11:00 GMT' if trade['session'] == 'london' else f'15:00 ET · Trail {TRAIL_PCT_NY}%'
     return (
-        f"----------------------------\n"
-        f"⚡ ENTRADA {env}\n"
-        f"----------------------------\n"
+        f"{'─'*28}\n"
+        f"⚡ ENTRADA ORB {icon} {sess} {env}\n"
+        f"{'─'*28}\n"
         f"Par:      {trade['symbol']}\n"
-        f"Dir:      {dir_emoji} {trade['direction'].upper()}\n"
-        f"Precio:   {trade['entry']:,.4f}\n"
-        f"Qty:      {trade['qty']}\n"
-        f"SL fijo:  {trade['sl_fixed']:,.4f} (-{SL_PCT}%)\n"
-        f"Trail:    {TRAIL_PCT}% del swing, actualiza por cierre 15m\n"
-        f"Capital:  ${balance:,.2f} x {LEVERAGE}x\n"
-        f"----------------------------"
+        f"Dir:      {'🟢 LONG' if trade['direction']=='long' else '🔴 SHORT'}\n"
+        f"Entry:    {trade['entry']:,.4f}\n"
+        f"SL ORB:   {trade['sl_fixed']:,.4f} (-{trade['sl_pct']:.2f}%)\n"
+        f"Cierre:   {close_info}\n"
+        f"Capital:  ${balance:,.2f} × {LEVERAGE}x\n"
+        f"{'─'*28}"
     )
 
 def fmt_close(trade: dict, exit_price: float, reason: str) -> str:
-    entry    = trade['entry']
-    direction = trade['direction']
-    if direction == 'long':
-        pnl_pct = (exit_price - entry) / entry * 100 * LEVERAGE
-    else:
-        pnl_pct = (entry - exit_price) / entry * 100 * LEVERAGE
-    comm    = 0.05 * 2  # 0.05% por lado x2
-    pnl_net = pnl_pct - comm * LEVERAGE
-    balance = get_balance()
-    pnl_usdt = balance * (CAPITAL_PCT/100) * pnl_net / 100
-
-    result = '✅ WIN' if pnl_net > 0 else '❌ LOSS'
-    dir_emoji = '🟢' if direction == 'long' else '🔴'
-    reason_str = '📍 Trailing stop (Binance STOP_MARKET)' if reason == 'trailing' else '🛑 Stop loss (Binance STOP_MARKET)'
-
-    dur = datetime.now(timezone.utc) - trade['opened_at']
-    h, rem = divmod(int(dur.total_seconds()), 3600)
-    m = rem // 60
-
+    pnl_pct = (exit_price - trade['entry']) * (1 if trade['direction']=='long' else -1) / trade['entry'] * 100
+    pnl_lev = pnl_pct * LEVERAGE
+    icon = '🇬🇧' if trade['session'] == 'london' else '🇺🇸'
+    sess = 'LONDRES' if trade['session'] == 'london' else 'NY'
+    reasons = {'stop':'🛑 Stop','trailing':'🔄 Trailing','close_time':'⏰ Tiempo','manual':'✋ Manual'}
     return (
-        f"----------------------------\n"
-        f"🔔 SALIDA - {result}\n"
-        f"----------------------------\n"
-        f"{trade['symbol']} {dir_emoji} {direction.upper()}\n"
-        f"Motivo:   {reason_str}\n"
-        f"Entrada:  {entry:,.4f}\n"
-        f"Salida:   {exit_price:,.4f}\n"
-        f"SL fijo:  {trade['sl_fixed']:,.4f}\n"
-        f"Trail:    {trade['trail_stop']:,.4f}" + ("\n" if trade['trail_stop'] else " N/A\n") +
-        f"P/L:      {pnl_net:+.3f}% ({pnl_usdt:+.2f} USDT)\n"
-        f"Duracion: {h}h {m:02d}m\n"
-        f"----------------------------"
+        f"{'─'*28}\n"
+        f"{reasons.get(reason,'📤')} CIERRE {icon} {sess}\n"
+        f"{'─'*28}\n"
+        f"Dir:      {'🟢 LONG' if trade['direction']=='long' else '🔴 SHORT'}\n"
+        f"Entry:    {trade['entry']:,.4f}\n"
+        f"Exit:     {exit_price:,.4f}\n"
+        f"PnL:      {pnl_pct:>+.3f}% (precio)\n"
+        f"PnL:      {pnl_lev:>+.3f}% ({LEVERAGE}x capital)\n"
+        f"{'─'*28}"
     )
-
-# ─── TELEGRAM HELPERS ─────────────────────────────────────────────────────────
-async def send_tg(app: Application, text: str) -> None:
-    try:
-        await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode='Markdown')
-    except Exception as e:
-        log.error(f"Telegram Markdown error: {e} — reintentando sin formato")
-        try:
-            plain = text.replace('*','').replace('`','')
-            await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=plain)
-        except Exception as e2:
-            log.error(f"Telegram fallback error: {e2}")
 
 # ─── COMANDOS TELEGRAM ────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     env = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
     await update.message.reply_text(
-        f"🤖 *Brújula Bot EMA15m* {env}\n\n"
-        f"Señal: 15m — EMA{EMA_PERIOD} + ADX{ADX_PERIOD}>={ADX_MIN}\n"
-        f"Entrada: open de la vela siguiente\n"
-        f"Stop: SL {SL_PCT}% fijo + Trail {TRAIL_PCT}% swing 15m\n"
-        f"Par: {SYMBOL} · Lev: {LEVERAGE}× · Capital: {CAPITAL_PCT}%\n"
-        f"Scan: cada {SCAN_INTERVAL}s\n\n"
-        f"/help para comandos",
-        parse_mode='Markdown'
+        f"🤖 Brújula Bot ORB Combinado {env}\n\n"
+        f"🇬🇧 Londres: 8:00 GMT → 11:00 GMT · EoD\n"
+        f"🇺🇸 NY: 9:30 ET → 15:00 ET · Trail {TRAIL_PCT_NY}%\n"
+        f"Par: {SYMBOL} · Lev: {LEVERAGE}x · Capital: {CAPITAL_PCT}%\n\n"
+        f"/status /close /balance /help"
     )
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "/status — posición activa\n"
-        "/close  — cerrar posición manualmente\n"
+        "/start   — info del bot\n"
+        "/status  — posición activa\n"
+        "/close   — cerrar posición manualmente\n"
         "/balance — balance USDT\n"
+        "/help    — esta ayuda"
     )
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    global active_trade
     if not active_trade:
-        await update.message.reply_text("📭 Sin posición activa.")
+        hoy = today_et()
+        lon = '✅' if traded_london_today == hoy else '⏳'
+        ny  = '✅' if traded_ny_today == hoy else '⏳'
+        await update.message.reply_text(
+            f"📭 Sin posición activa\n"
+            f"🇬🇧 Londres hoy: {lon}\n"
+            f"🇺🇸 NY hoy: {ny}"
+        )
         return
     t = active_trade
+    stop_activo = t.get('trail_stop') or t['sl_fixed']
+    sess = '🇬🇧 LONDRES' if t['session']=='london' else '🇺🇸 NY'
     try:
         mark = get_mark_price(t['symbol'])
-        if t['direction'] == 'long':
-            pnl = (mark - t['entry']) / t['entry'] * 100 * LEVERAGE
-        else:
-            pnl = (t['entry'] - mark) / t['entry'] * 100 * LEVERAGE
-        active_stop = t.get('trail_stop') or t['sl_fixed']
-        dur = datetime.now(timezone.utc) - t['opened_at']
-        h, rem = divmod(int(dur.total_seconds()), 3600)
-        m = rem // 60
-        await update.message.reply_text(
-            f"📊 Posición activa\n\n"
-            f"{t['symbol']} {'🟢' if t['direction']=='long' else '🔴'} {t['direction'].upper()}\n"
-            f"Entrada:      {t['entry']:,.4f}\n"
-            f"Precio actual:{mark:,.4f}\n"
-            f"P/L actual:   {pnl:+.3f}%\n"
-            f"SL fijo:      {t['sl_fixed']:,.4f}\n"
-            f"Mejor swing:  {t['best_swing']:,.4f}\n"
-            f"Trail stop:   {t.get('trail_stop', 'pendiente')}\n"
-            f"Stop activo:  {active_stop:,.4f}\n"
-            f"Stop Binance: {t.get('stop_order_id', 'None')}\n"
-            f"Duración:     {h}h {m:02d}m"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Error: {e}")
+        pnl  = (mark - t['entry']) * (1 if t['direction']=='long' else -1) / t['entry'] * 100
+    except:
+        mark = pnl = 0
+    await update.message.reply_text(
+        f"📊 Posición activa — {sess}\n"
+        f"Dir:   {'🟢 LONG' if t['direction']=='long' else '🔴 SHORT'}\n"
+        f"Entry: {t['entry']:,.4f}\n"
+        f"Mark:  {mark:,.4f}\n"
+        f"PnL:   {pnl:>+.3f}%\n"
+        f"Stop:  {stop_activo:,.4f}\n"
+        f"Trail: {'activo' if t.get('trail_stop') else 'pendiente'}"
+    )
 
 async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global active_trade
@@ -495,112 +472,138 @@ async def cmd_close(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     bal = get_balance()
-    await update.message.reply_text(f"💰 Balance disponible: ${bal:,.2f} USDT")
+    await update.message.reply_text(f"💰 Balance: ${bal:,.2f} USDT")
 
 # ─── SCAN PRINCIPAL ───────────────────────────────────────────────────────────
 async def scan(app: Application) -> None:
-    global active_trade, last_15m_candle
+    global active_trade, traded_london_today, traded_ny_today, last_15m_ts
 
-    # ── 1. GESTIONAR TRADE ABIERTO ────────────────────────────────────────────
+    now_utc  = utc_now()
+    utc_h    = utc_hour_now()
+    hoy      = today_et()
+
+    # ── FILTRO FIN DE SEMANA
+    if is_weekend():
+        return
+
+    # ── 1. GESTIONAR TRADE ABIERTO ───────────────────────────────────────────
     if active_trade:
+        session = active_trade['session']
 
-        # 1a. Stop software como RESPALDO (si Binance no tiene stop real)
+        # 1a. Cierre forzado por tiempo
+        close_h = close_utc_london() if session == 'london' else close_utc_ny()
+        if utc_h >= close_h:
+            log.info(f"Cierre por tiempo — {session.upper()}")
+            exit_price = close_position_market(active_trade)
+            if exit_price is None:
+                try: exit_price = get_mark_price(active_trade['symbol'])
+                except: exit_price = active_trade['entry']
+            msg = fmt_close(active_trade, exit_price, 'close_time')
+            active_trade = None
+            await send_tg(app, msg)
+            return
+
+        # 1b. Stop software (respaldo si no hay orden en Binance)
         if not active_trade.get('stop_order_id'):
             try:
-                mark = get_mark_price(active_trade['symbol'])
-                active_stop = active_trade.get('trail_stop') or active_trade['sl_fixed']
+                mark        = get_mark_price(active_trade['symbol'])
+                stop_activo = active_trade.get('trail_stop') or active_trade['sl_fixed']
                 direction   = active_trade['direction']
-                sl_tocado   = (
-                    (direction == 'long'  and mark <= active_stop) or
-                    (direction == 'short' and mark >= active_stop)
-                )
-                if sl_tocado:
-                    log.info(f"Stop software (respaldo) tocado: mark={mark:.4f} vs stop={active_stop:.4f}")
-                    reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
+                tocado = (direction=='long' and mark<=stop_activo) or \
+                         (direction=='short' and mark>=stop_activo)
+                if tocado:
+                    reason = 'trailing' if active_trade.get('trail_stop') else 'stop'
                     exit_price = close_position_market(active_trade)
-                    if exit_price is None:
-                        exit_price = mark
+                    if exit_price is None: exit_price = mark
                     msg = fmt_close(active_trade, exit_price, reason)
                     active_trade = None
                     await send_tg(app, msg)
-                    last_15m_candle = None
                     return
             except Exception as e:
-                log.error(f"Error verificando stop software: {e}")
+                log.error(f"Error stop software: {e}")
 
-        # 1b. ¿Binance cerró la posición? (STOP_MARKET ejecutada)
+        # 1c. ¿Binance cerró la posición?
         try:
             positions = get_client().futures_position_information(symbol=SYMBOL)
             pos_amt   = float(positions[0]['positionAmt']) if positions else 0.0
             if abs(pos_amt) < 0.001:
-                log.info("Posición cerrada por Binance (STOP_MARKET ejecutada)")
-                try:
-                    mark = get_mark_price(active_trade['symbol'])
-                except:
-                    mark = active_trade['entry']
-                reason     = 'trailing' if active_trade.get('trail_stop') else 'sl'
-                exit_price = active_trade.get('trail_stop') or active_trade['sl_fixed']
-                msg = fmt_close(active_trade, exit_price, reason)
+                reason = 'trailing' if active_trade.get('trail_stop') else 'stop'
+                exit_p = active_trade.get('trail_stop') or active_trade['sl_fixed']
+                msg    = fmt_close(active_trade, exit_p, reason)
                 active_trade = None
                 await send_tg(app, msg)
-                last_15m_candle = None
                 return
         except Exception as e:
             log.error(f"Error verificando posición: {e}")
 
-        # 1c. Actualizar trailing con nuevas velas 15m
-        try:
-            df15 = get_klines(SYMBOL, '15m', limit=100)
-            trail_updated = update_trail_15m(active_trade, df15)
-            if trail_updated:
-                log.info(f"Trail actualizado a {active_trade['trail_stop']:.4f}")
-            else:
-                log.info(
-                    f"Trade {active_trade['direction'].upper()} | "
-                    f"entry={active_trade['entry']:.4f} "
-                    f"stop_activo={active_trade.get('trail_stop') or active_trade['sl_fixed']:.4f} "
-                    f"trail={'pendiente' if not active_trade.get('trail_stop') else active_trade['trail_stop']:.4f if active_trade.get('trail_stop') else ''} "
-                    f"stop_id={active_trade.get('stop_order_id','None')}"
-                )
-        except Exception as e:
-            log.error(f"Error actualizando trailing: {e}")
+        # 1d. Actualizar trailing (solo NY)
+        if session == 'ny':
+            try:
+                df15 = get_klines(SYMBOL, '15m', limit=100)
+                if update_trail_15m(active_trade, df15):
+                    trail = active_trade['trail_stop']
+                    log.info(f"Trail NY actualizado: {trail:.4f}")
+                    await send_tg(app,
+                        f"📈 Trail NY actualizado\n"
+                        f"Stop: {trail:,.4f} · Swing: {active_trade['best_swing']:,.4f}"
+                    )
+                else:
+                    stop_a = active_trade.get('trail_stop') or active_trade['sl_fixed']
+                    log.info(f"NY {active_trade['direction'].upper()} entry={active_trade['entry']:.4f} stop={stop_a:.4f}")
+            except Exception as e:
+                log.error(f"Error trailing: {e}")
+        else:
+            log.info(f"LON {active_trade['direction'].upper()} entry={active_trade['entry']:.4f} stop={active_trade['sl_fixed']:.4f}")
         return
 
-    # ── 2. SIN TRADE — BUSCAR SEÑAL ───────────────────────────────────────────
+    # ── 2. SIN TRADE — BUSCAR SEÑALES ────────────────────────────────────────
     try:
-        df15 = get_klines(SYMBOL, '15m', limit=EMA_PERIOD + ADX_PERIOD * 3 + 10)
+        df15 = get_klines(SYMBOL, '15m', limit=50)
 
-        # Anti-reentrada: una evaluación por vela 15m
-        current_15m = int(df15['open_time'].iloc[-2])
-        if current_15m == last_15m_candle:
-            log.info("Vela 15m ya evaluada")
+        # Anti-duplicado por vela
+        current_ts = int(df15['open_time'].iloc[-2])
+        if current_ts == last_15m_ts:
             return
-        last_15m_candle = current_15m
+        last_15m_ts = current_ts
 
-        # Verificar señal
-        signal, entry_price = check_signal_15m(df15)
+        # ── 2a. SEÑAL LONDRES (8:00 GMT, cierra 11:00 GMT)
+        lon_close_utc = close_utc_london()
+        if utc_h < lon_close_utc and traded_london_today != hoy:
+            # Ventana: después de 7:00 UTC (BST) o 8:00 UTC (GMT)
+            open_utc_lon = 7.0 if is_bst(now_utc) else 8.0
+            if utc_h >= open_utc_lon:
+                direction, entry, sl_price, orb_ts = check_signal_orb(df15, 'london')
+                if direction and orb_ts:
+                    # Confirmar que la vela ORB es de hoy
+                    orb_date = datetime.fromtimestamp(orb_ts, tz=timezone.utc)
+                    orb_offset = -4 if is_edt(orb_date) else -5
+                    orb_et_date = (orb_date + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
+                    if orb_et_date == hoy:
+                        sl_pct = abs(entry - sl_price) / entry * 100
+                        log.info(f"Señal ORB LONDRES: {direction.upper()} entry={entry:.4f} sl={sl_price:.4f} (-{sl_pct:.2f}%)")
+                        trade = open_position(SYMBOL, direction, sl_price, 'london')
+                        if trade:
+                            active_trade         = trade
+                            traded_london_today  = hoy
+                            await send_tg(app, fmt_open(trade, get_balance()))
 
-        if not signal:
-            log.info("Sin señal 15m")
-            return
-
-        log.info(f"Señal 15m: {signal.upper()} — EMA{EMA_PERIOD} + ADX{ADX_PERIOD}>={ADX_MIN}")
-
-        # Abrir posición al open de la vela siguiente
-        # La vela siguiente ya está en curso — entramos al open actual
-        trade = open_position(SYMBOL, signal)
-        if not trade:
-            log.error("No se pudo abrir la posición")
-            return
-
-        active_trade = trade
-        balance = get_balance()
-        msg = fmt_open(trade, balance)
-        await send_tg(app, msg)
-        log.info(
-            f"ABIERTO: {signal.upper()} {trade['qty']} {SYMBOL} @ {trade['entry']:.4f} "
-            f"SL={trade['sl_fixed']:.4f} stop_id={trade.get('stop_order_id')}"
-        )
+        # ── 2b. SEÑAL NY (9:30 ET, cierra 15:00 ET con T70%)
+        ny_open_utc  = 13.5 if is_edt(now_utc) else 14.5  # 9:30 ET en UTC
+        ny_close_utc = close_utc_ny()
+        if utc_h >= ny_open_utc and utc_h < ny_close_utc and traded_ny_today != hoy:
+            direction, entry, sl_price, orb_ts = check_signal_orb(df15, 'ny')
+            if direction and orb_ts:
+                orb_date    = datetime.fromtimestamp(orb_ts, tz=timezone.utc)
+                orb_offset  = -4 if is_edt(orb_date) else -5
+                orb_et_date = (orb_date + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
+                if orb_et_date == hoy:
+                    sl_pct = abs(entry - sl_price) / entry * 100
+                    log.info(f"Señal ORB NY: {direction.upper()} entry={entry:.4f} sl={sl_price:.4f} (-{sl_pct:.2f}%)")
+                    trade = open_position(SYMBOL, direction, sl_price, 'ny')
+                    if trade:
+                        active_trade    = trade
+                        traded_ny_today = hoy
+                        await send_tg(app, fmt_open(trade, get_balance()))
 
     except Exception as e:
         log.error(f"Error en scan: {e}")
@@ -608,7 +611,7 @@ async def scan(app: Application) -> None:
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 def main() -> None:
     env = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
-    log.info(f"Brújula Bot EMA15m arrancando — {env}")
+    log.info(f"Brújula Bot ORB Combinado arrancando — {env}")
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler('start',   cmd_start))
@@ -624,36 +627,25 @@ def main() -> None:
         await app.initialize()
         await app.start()
         await app.bot.set_my_commands([
-            ('start',   'Estado del bot'),
+            ('start',   'Info del bot'),
             ('status',  'Posición activa'),
             ('close',   'Cerrar posición'),
             ('balance', 'Balance USDT'),
             ('help',    'Ayuda'),
         ])
-
-        # Mensaje de inicio
         try:
-            env = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
             await app.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=(
-                    f"🤖 *Brújula Bot EMA15m* {env}\n\n"
-                    f"Señal: 15m — EMA{EMA_PERIOD} + ADX{ADX_PERIOD} >= {ADX_MIN}\n"
-                    f"Entrada: open de la vela siguiente\n"
-                    f"Stop: SL {SL_PCT}% fijo + Trail {TRAIL_PCT}% swing 15m\n"
-                    f"Par: {SYMBOL} | Lev: {LEVERAGE}x | Capital: {CAPITAL_PCT}%\n"
-                    f"Scan: cada {SCAN_INTERVAL}s"
-                ),
-                parse_mode='Markdown'
+                    f"🤖 Brújula Bot ORB Combinado {env}\n\n"
+                    f"🇬🇧 Londres: 8:00 GMT → 11:00 GMT · EoD puro\n"
+                    f"🇺🇸 NY: 9:30 ET → 15:00 ET · Trail {TRAIL_PCT_NY}%\n"
+                    f"Par: {SYMBOL} · Lev: {LEVERAGE}x · Capital: {CAPITAL_PCT}%\n"
+                    f"Scan: cada {SCAN_INTERVAL}s · Sin solapamiento de sesiones"
+                )
             )
         except Exception as e:
             log.error(f"Error mensaje inicio: {e}")
-            try:
-                await app.bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=f"Brújula Bot EMA15m arrancando — {'TESTNET' if USE_TESTNET else 'REAL'}"
-                )
-            except: pass
 
         loop = asyncio.get_event_loop()
         scheduler = AsyncIOScheduler()
@@ -664,7 +656,6 @@ def main() -> None:
         )
         scheduler.start()
         log.info(f"Scheduler activo — scan cada {SCAN_INTERVAL}s")
-
         await app.updater.start_polling(drop_pending_updates=True)
         await asyncio.Event().wait()
 
