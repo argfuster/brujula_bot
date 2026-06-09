@@ -1,34 +1,39 @@
 """
 Brújula Bot — ORB Combinado Londres + NY
 =========================================
-Modelo validado (2020-2026): $42.5M desde $1,000 · Sharpe 1.59
+Modelo validado (2020-2026): Sharpe 1.70 · MaxDD -21.4%
 
-SESIÓN LONDRES (sin trailing):
-  Señal:   Primera vela 15m del día a las 8:00 GMT (BST: 7:00 UTC / GMT: 8:00 UTC)
-  Entry:   Close de la vela ORB
-  Stop:    Low (BULL) / High (BEAR) de la vela ORB — mechas incluidas
-  Cierre:  11:00 GMT (antes del fixing de Londres)
-  Trail:   DESACTIVADO — EoD puro
+SESIÓN LONDRES:
+  Señal:   Primera vela 15m del día a las 8:00 GMT
+  Entry:   Close de la vela ORB (o fallback hasta v4 si EMA falla)
+  Stop:    Low (BULL) / High (BEAR) de la vela ORB
+  Cierre:  11:00 GMT · EoD puro
 
-SESIÓN NY (con trailing 70%):
-  Señal:   Primera vela 15m del día a las 9:30 ET (EDT: 13:30 UTC / EST: 14:30 UTC)
-  Entry:   Close de la vela ORB
-  Stop:    Low (BULL) / High (BEAR) de la vela ORB — mechas incluidas
-  Trailing: 70% del swing · actualizado por closes de 15m
-  Cierre:  15:00 ET (backstop si trail no se activó)
+SESIÓN NY:
+  Señal:   Primera vela 15m del día a las 9:30 ET
+  Entry:   Close de la vela ORB (o fallback hasta v4 si EMA falla)
+  Stop:    Low (BULL) / High (BEAR) de la vela ORB
+  Cierre:  15:00 ET · EoD puro
 
-CAPITAL: 100% del disponible en cada señal · compuesto trade a trade
-  → Londres cierra antes de que abra NY → nunca hay dos posiciones simultáneas
+FILTROS (ambas sesiones):
+  EMA50 15m  — LONG si close > EMA · SHORT si close < EMA
+               Fallback: monitorea hasta 4 velas. Si ninguna cumple → descarta el día.
+  Stop dist  — 0.2% < (entry-stop)/entry < 1.5%
+               Filtra velas laterales (chicas) y explosivas (grandes).
+
+CAPITAL: 98% del disponible en cada señal · compuesto trade a trade
 
 Variables Railway:
   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
   BINANCE_API_KEY, BINANCE_API_SECRET
-  USE_TESTNET   (true)
-  SYMBOL        (ETHUSDT)
-  LEVERAGE      (5)
-  CAPITAL_PCT   (100)
-  TRAIL_PCT_NY  (70)   ← solo aplica a NY
-  SCAN_INTERVAL (30)
+  USE_TESTNET     (true)
+  SYMBOL          (ETHUSDT)
+  LEVERAGE        (3)
+  CAPITAL_PCT     (98)
+  EMA_PERIOD      (50)
+  STOP_DIST_MIN   (0.2)
+  STOP_DIST_MAX   (1.5)
+  SCAN_INTERVAL   (30)
 """
 
 import os, time, logging, math, hmac, hashlib, urllib.parse
@@ -51,9 +56,11 @@ BINANCE_KEY      = os.environ.get('BINANCE_API_KEY', '')
 BINANCE_SECRET   = os.environ.get('BINANCE_API_SECRET', '')
 USE_TESTNET      = os.environ.get('USE_TESTNET', 'true').lower() == 'true'
 SYMBOL           = os.environ.get('TRADING_SYMBOL', 'ETHUSDT')
-LEVERAGE         = int(os.environ.get('LEVERAGE', '5'))
-CAPITAL_PCT      = float(os.environ.get('CAPITAL_PCT', '100'))
-TRAIL_PCT_NY     = float(os.environ.get('TRAIL_PCT_NY', '70'))
+LEVERAGE         = int(os.environ.get('LEVERAGE', '3'))
+CAPITAL_PCT      = float(os.environ.get('CAPITAL_PCT', '98'))
+EMA_PERIOD       = int(os.environ.get('EMA_PERIOD', '50'))
+STOP_DIST_MIN    = float(os.environ.get('STOP_DIST_MIN', '0.2'))
+STOP_DIST_MAX    = float(os.environ.get('STOP_DIST_MAX', '1.5'))
 SCAN_INTERVAL    = int(os.environ.get('SCAN_INTERVAL', '30'))
 
 # ─── ESTADO GLOBAL ────────────────────────────────────────────────────────────
@@ -165,51 +172,92 @@ def round_qty(qty: float, step: float) -> float:
     decimals = max(0, round(-math.log10(step)))
     return round(math.floor(qty / step) * step, decimals)
 
+# ─── EMA ──────────────────────────────────────────────────────────────────────
+def calc_ema(closes: list[float], period: int) -> list[float]:
+    """EMA estándar sobre lista de closes. Seed con SMA de los primeros `period` valores."""
+    if len(closes) < period:
+        return [0.0] * len(closes)
+    k = 2 / (period + 1)
+    ema = [0.0] * len(closes)
+    ema[period - 1] = sum(closes[:period]) / period
+    for i in range(period, len(closes)):
+        ema[i] = closes[i] * k + ema[i-1] * (1 - k)
+    return ema
+
 # ─── SEÑAL ORB ────────────────────────────────────────────────────────────────
 def check_signal_orb(df15: pd.DataFrame, session: str) -> tuple[str|None, float, float, int]:
     """
-    Evalúa SOLO la primera vela de la sesión (8:00 GMT o 9:30 ET) de HOY.
-    Si esa vela no cerró aún o no es de hoy → sin señal.
-    Si la vela es doji exacto (close==open) → sin señal.
+    Evalúa la primera vela de la sesión y hasta 3 fallbacks (4 velas = 1h).
+    Filtros aplicados sobre la vela seleccionada:
+      1. EMA50 15m — LONG si close > EMA · SHORT si close < EMA
+      2. Stop dist — STOP_DIST_MIN% < dist < STOP_DIST_MAX%
+    Si ninguna vela cumple ambos filtros → sin señal.
     """
-    is_orb_fn   = is_orb_london if session == 'london' else is_orb_ny
-    closed      = df15.iloc[:-1]   # excluir vela abierta actual
-    hoy_et      = today_et()       # 'YYYY-MM-DD' en ET
+    is_orb_fn = is_orb_london if session == 'london' else is_orb_ny
+    closed    = df15.iloc[:-1]   # excluir vela abierta actual
+    hoy_et    = today_et()
 
-    for _, row in closed.iterrows():
-        ts_ms = int(row['open_time'])
-        ts    = ts_ms // 1000          # Binance devuelve ms → convertir a segundos
+    # Calcular EMA sobre todos los closes cerrados
+    closes = [float(r['close']) for _, r in closed.iterrows()]
+    ema_vals = calc_ema(closes, EMA_PERIOD) if EMA_PERIOD > 0 else [0.0] * len(closes)
+
+    # Encontrar índice de la vela ORB de hoy
+    orb_idx = None
+    for idx, (_, row) in enumerate(closed.iterrows()):
+        ts = int(row['open_time']) // 1000
         if not is_orb_fn(ts):
             continue
-
-        # Verificar que la vela ORB es de hoy (en ET)
         orb_dt     = datetime.fromtimestamp(ts, tz=timezone.utc)
         orb_offset = -4 if is_edt(orb_dt) else -5
         orb_et     = (orb_dt + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
         if orb_et != hoy_et:
             return None, 0.0, 0.0, 0
-
-        # Verificar que la vela ORB cerró hace menos de 2 velas (30 min máximo)
-        # Evita entrar horas después al precio actual en lugar del close ORB
+        # Verificar que no sea demasiado antigua
         now_ts = int(utc_now().timestamp())
-        orb_close_ts = ts + 15 * 60  # la vela de 15m cierra 15 min después del open
-        mins_elapsed = (now_ts - orb_close_ts) / 60
-        if mins_elapsed > 30:
-            log.info(f"Vela ORB de {session.upper()} tiene {mins_elapsed:.0f} min — demasiado tarde para entrar")
-            return None, 0.0, 0.0, 0  # vela ORB de otro día — no aplica
+        orb_close_ts = ts + 15 * 60
+        if (now_ts - orb_close_ts) / 60 > 30 + 3 * 15:  # hasta 4 velas (75 min)
+            log.info(f"Vela ORB {session.upper()} demasiado antigua")
+            return None, 0.0, 0.0, 0
+        orb_idx = idx
+        break
 
-        # Vela ORB de hoy encontrada — sin filtro doji
+    if orb_idx is None:
+        return None, 0.0, 0.0, 0
+
+    # Probar vela ORB + hasta 3 fallbacks
+    rows_list = list(closed.iterrows())
+    for offset in range(4):
+        ci = orb_idx + offset
+        if ci >= len(rows_list):
+            break
+        _, row = rows_list[ci]
         o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
-        if c > o:
-            direction = 'long'
-        elif c < o:
-            direction = 'short'
-        else:
-            direction = 'long' if (h - c) < (c - l) else 'short'
-        sl_price = l if direction == 'long' else h
-        return direction, c, sl_price, ts   # ts en segundos
 
-    return None, 0.0, 0.0, 0
+        # Doji exacto → skip
+        if c == o:
+            continue
+
+        direction = 'long' if c > o else 'short'
+
+        # Filtro EMA
+        if EMA_PERIOD > 0 and ema_vals[ci] > 0:
+            ema_ok = (direction == 'long' and c > ema_vals[ci]) or \
+                     (direction == 'short' and c < ema_vals[ci])
+            if not ema_ok:
+                continue
+
+        # Filtro stop dist
+        sl_price  = l if direction == 'long' else h
+        stop_dist = abs(c - sl_price) / c * 100
+        if stop_dist < STOP_DIST_MIN or stop_dist > STOP_DIST_MAX:
+            log.info(f"Stop dist {stop_dist:.3f}% fuera de rango [{STOP_DIST_MIN},{STOP_DIST_MAX}] — vela {offset+1}")
+            continue
+
+        ts = int(row['open_time']) // 1000
+        log.info(f"Señal ORB {session.upper()} v{offset+1}: {direction.upper()} entry={c:.4f} sl={sl_price:.4f} dist={stop_dist:.3f}% ema={ema_vals[ci]:.4f}")
+        return direction, c, sl_price, ts, offset + 1
+
+    return None, 0.0, 0.0, 0, 0
 
 # ─── ÓRDENES ──────────────────────────────────────────────────────────────────
 def place_stop_order(symbol: str, direction: str, qty: float, stop_price: float) -> str | None:
@@ -257,7 +305,7 @@ def cancel_stop_order(symbol: str, order_id: str | None) -> bool:
         log.error(f"Error cancelando stop: {e}")
         return False
 
-def open_position(symbol: str, direction: str, sl_price: float, session: str) -> dict | None:
+def open_position(symbol: str, direction: str, sl_price: float, session: str, **kwargs) -> dict | None:
     try:
         balance  = get_balance()
         mark     = get_mark_price(symbol)
@@ -310,6 +358,7 @@ def open_position(symbol: str, direction: str, sl_price: float, session: str) ->
             'trail_stop':    None,
             'stop_order_id': stop_id,
             'opened_at':     utc_now(),
+            'orb_vela':      kwargs.get('orb_vela', 1),
         }
     except Exception as e:
         log.error(f"Error abriendo posición: {e}")
@@ -386,16 +435,18 @@ def fmt_open(trade: dict, balance: float) -> str:
     env  = '🧪 TESTNET' if USE_TESTNET else '🔴 REAL'
     icon = '🇬🇧' if trade['session'] == 'london' else '🇺🇸'
     sess = 'LONDRES' if trade['session'] == 'london' else 'NY'
-    close_info = '11:00 GMT' if trade['session'] == 'london' else f'15:00 ET · Trail {TRAIL_PCT_NY}%'
+    close_info = '11:00 GMT' if trade['session'] == 'london' else '15:00 ET'
+    orb_vela = trade.get('orb_vela', 1)
+    vela_str = f" (v{orb_vela})" if orb_vela > 1 else ""
     return (
         f"{'─'*28}\n"
         f"⚡ ENTRADA ORB {icon} {sess} {env}\n"
         f"{'─'*28}\n"
         f"Par:      {trade['symbol']}\n"
-        f"Dir:      {'🟢 LONG' if trade['direction']=='long' else '🔴 SHORT'}\n"
+        f"Dir:      {'🟢 LONG' if trade['direction']=='long' else '🔴 SHORT'}{vela_str}\n"
         f"Entry:    {trade['entry']:,.4f}\n"
         f"SL ORB:   {trade['sl_fixed']:,.4f} (-{trade['sl_pct']:.2f}%)\n"
-        f"Cierre:   {close_info}\n"
+        f"Cierre:   {close_info} · EoD\n"
         f"Capital:  ${balance:,.2f} × {LEVERAGE}x\n"
         f"{'─'*28}"
     )
@@ -424,7 +475,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"🤖 Brújula Bot ORB Combinado {env}\n\n"
         f"🇬🇧 Londres: 8:00 GMT → 11:00 GMT · EoD\n"
-        f"🇺🇸 NY: 9:30 ET → 15:00 ET · Trail {TRAIL_PCT_NY}%\n"
+        f"🇺🇸 NY: 9:30 ET → 15:00 ET · EoD\n"
+        f"📊 EMA{EMA_PERIOD} · Dist {STOP_DIST_MIN}%–{STOP_DIST_MAX}%\n"
         f"Par: {SYMBOL} · Lev: {LEVERAGE}x · Capital: {CAPITAL_PCT}%\n\n"
         f"/status /close /balance /help"
     )
@@ -546,29 +598,14 @@ async def scan(app: Application) -> None:
         except Exception as e:
             log.error(f"Error verificando posición: {e}")
 
-        # 1d. Actualizar trailing (solo NY)
-        if session == 'ny':
-            try:
-                df15 = get_klines(SYMBOL, '15m', limit=100)
-                if update_trail_15m(active_trade, df15):
-                    trail = active_trade['trail_stop']
-                    log.info(f"Trail NY actualizado: {trail:.4f}")
-                    await send_tg(app,
-                        f"📈 Trail NY actualizado\n"
-                        f"Stop: {trail:,.4f} · Swing: {active_trade['best_swing']:,.4f}"
-                    )
-                else:
-                    stop_a = active_trade.get('trail_stop') or active_trade['sl_fixed']
-                    log.info(f"NY {active_trade['direction'].upper()} entry={active_trade['entry']:.4f} stop={stop_a:.4f}")
-            except Exception as e:
-                log.error(f"Error trailing: {e}")
-        else:
-            log.info(f"LON {active_trade['direction'].upper()} entry={active_trade['entry']:.4f} stop={active_trade['sl_fixed']:.4f}")
+        # 1d. Log estado del trade activo
+        stop_activo = active_trade.get('trail_stop') or active_trade['sl_fixed']
+        log.info(f"{session.upper()} {active_trade['direction'].upper()} entry={active_trade['entry']:.4f} stop={stop_activo:.4f}")
         return
 
     # ── 2. SIN TRADE — BUSCAR SEÑALES ────────────────────────────────────────
     try:
-        df15 = get_klines(SYMBOL, '15m', limit=50)
+        df15 = get_klines(SYMBOL, '15m', limit=100)
 
         # Anti-duplicado por vela
         current_ts = int(df15['open_time'].iloc[-2])
@@ -579,45 +616,45 @@ async def scan(app: Application) -> None:
         # ── 2a. SEÑAL LONDRES (8:00 GMT, cierra 11:00 GMT)
         lon_close_utc = close_utc_london()
         if utc_h < lon_close_utc and traded_london_today != hoy:
-            # Ventana: después de 7:00 UTC (BST) o 8:00 UTC (GMT)
             open_utc_lon = 7.0 if is_bst(now_utc) else 8.0
             if utc_h >= open_utc_lon:
-                direction, entry, sl_price, orb_ts = check_signal_orb(df15, 'london')
+                direction, entry, sl_price, orb_ts, orb_vela = check_signal_orb(df15, 'london')
                 if direction and orb_ts:
-                    # Confirmar que la vela ORB es de hoy
-                    orb_date = datetime.fromtimestamp(orb_ts, tz=timezone.utc)
-                    orb_offset = -4 if is_edt(orb_date) else -5
+                    orb_date    = datetime.fromtimestamp(orb_ts, tz=timezone.utc)
+                    orb_offset  = -4 if is_edt(orb_date) else -5
                     orb_et_date = (orb_date + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
                     if orb_et_date == hoy:
                         sl_pct = abs(entry - sl_price) / entry * 100
-                        log.info(f"Señal ORB LONDRES: {direction.upper()} entry={entry:.4f} sl={sl_price:.4f} (-{sl_pct:.2f}%)")
-                        trade = open_position(SYMBOL, direction, sl_price, 'london')
+                        log.info(f"Señal ORB LONDRES v{orb_vela}: {direction.upper()} entry={entry:.4f} sl={sl_price:.4f} (-{sl_pct:.2f}%)")
+                        bal_pre = get_balance()
+                        trade = open_position(SYMBOL, direction, sl_price, 'london', orb_vela=orb_vela)
                         if trade:
-                            active_trade         = trade
-                            traded_london_today  = hoy
-                            await send_tg(app, fmt_open(trade, get_balance()))
+                            active_trade        = trade
+                            traded_london_today = hoy
+                            await send_tg(app, fmt_open(trade, bal_pre))
                         else:
-                            traded_london_today = hoy  # evitar reintentos aunque falle
+                            traded_london_today = hoy
 
-        # ── 2b. SEÑAL NY (9:30 ET, cierra 15:00 ET con T70%)
-        ny_open_utc  = 13.5 if is_edt(now_utc) else 14.5  # 9:30 ET en UTC
+        # ── 2b. SEÑAL NY (9:30 ET, cierra 15:00 ET · EoD puro)
+        ny_open_utc  = 13.5 if is_edt(now_utc) else 14.5
         ny_close_utc = close_utc_ny()
         if utc_h >= ny_open_utc and utc_h < ny_close_utc and traded_ny_today != hoy:
-            direction, entry, sl_price, orb_ts = check_signal_orb(df15, 'ny')
+            direction, entry, sl_price, orb_ts, orb_vela = check_signal_orb(df15, 'ny')
             if direction and orb_ts:
                 orb_date    = datetime.fromtimestamp(orb_ts, tz=timezone.utc)
                 orb_offset  = -4 if is_edt(orb_date) else -5
                 orb_et_date = (orb_date + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
                 if orb_et_date == hoy:
                     sl_pct = abs(entry - sl_price) / entry * 100
-                    log.info(f"Señal ORB NY: {direction.upper()} entry={entry:.4f} sl={sl_price:.4f} (-{sl_pct:.2f}%)")
-                    trade = open_position(SYMBOL, direction, sl_price, 'ny')
+                    log.info(f"Señal ORB NY v{orb_vela}: {direction.upper()} entry={entry:.4f} sl={sl_price:.4f} (-{sl_pct:.2f}%)")
+                    bal_pre = get_balance()
+                    trade = open_position(SYMBOL, direction, sl_price, 'ny', orb_vela=orb_vela)
                     if trade:
                         active_trade    = trade
                         traded_ny_today = hoy
-                        await send_tg(app, fmt_open(trade, get_balance()))
+                        await send_tg(app, fmt_open(trade, bal_pre))
                     else:
-                        traded_ny_today = hoy  # evitar reintentos aunque falle
+                        traded_ny_today = hoy
 
     except Exception as e:
         log.error(f"Error en scan: {e}")
@@ -652,8 +689,9 @@ def main() -> None:
                 chat_id=TELEGRAM_CHAT_ID,
                 text=(
                     f"🤖 Brújula Bot ORB Combinado {env}\n\n"
-                    f"🇬🇧 Londres: 8:00 GMT → 11:00 GMT · EoD puro\n"
-                    f"🇺🇸 NY: 9:30 ET → 15:00 ET · Trail {TRAIL_PCT_NY}%\n"
+                    f"🇬🇧 Londres: 8:00 GMT → 11:00 GMT · EoD\n"
+                    f"🇺🇸 NY: 9:30 ET → 15:00 ET · EoD\n"
+                    f"📊 EMA{EMA_PERIOD} · Dist {STOP_DIST_MIN}%–{STOP_DIST_MAX}%\n"
                     f"Par: {SYMBOL} · Lev: {LEVERAGE}x · Capital: {CAPITAL_PCT}%\n"
                     f"Scan: cada {SCAN_INTERVAL}s · Sin solapamiento de sesiones"
                 )
