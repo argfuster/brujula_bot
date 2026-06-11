@@ -612,6 +612,7 @@ async def scan(app: Application) -> None:
         if current_ts == last_15m_ts:
             return
         last_15m_ts = current_ts
+        log.info(f"Nueva vela detectada ts={current_ts} utc_h={utc_h:.2f} hoy={hoy}")
 
         # ── 2a. SEÑAL LONDRES (8:00 GMT, cierra 11:00 GMT)
         lon_close_utc = close_utc_london()
@@ -638,8 +639,10 @@ async def scan(app: Application) -> None:
         # ── 2b. SEÑAL NY (9:30 ET, cierra 15:00 ET · EoD puro)
         ny_open_utc  = 13.5 if is_edt(now_utc) else 14.5
         ny_close_utc = close_utc_ny()
+        log.info(f"NY check: utc_h={utc_h:.2f} ny_open={ny_open_utc} ny_close={ny_close_utc} traded={traded_ny_today} hoy={hoy}")
         if utc_h >= ny_open_utc and utc_h < ny_close_utc and traded_ny_today != hoy:
             direction, entry, sl_price, orb_ts, orb_vela = check_signal_orb(df15, 'ny')
+            log.info(f"NY check_signal_orb → dir={direction} ts={orb_ts} vela={orb_vela}")
             if direction and orb_ts:
                 orb_date    = datetime.fromtimestamp(orb_ts, tz=timezone.utc)
                 orb_offset  = -4 if is_edt(orb_date) else -5
