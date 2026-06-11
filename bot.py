@@ -212,10 +212,10 @@ def check_signal_orb(df15: pd.DataFrame, session: str) -> tuple[str|None, float,
         orb_et     = (orb_dt + timedelta(hours=orb_offset)).strftime('%Y-%m-%d')
         if orb_et != hoy_et:
             return None, 0.0, 0.0, 0, 0
-        # Verificar que no sea demasiado antigua
+        # Verificar que no sea demasiado antigua — usar v4 como límite (ts + 4 velas)
         now_ts = int(utc_now().timestamp())
-        orb_close_ts = ts + 15 * 60
-        if (now_ts - orb_close_ts) / 60 > 30 + 3 * 15:  # hasta 4 velas (75 min)
+        v4_close_ts = ts + 4 * 15 * 60  # cierre de la última vela del fallback
+        if now_ts > v4_close_ts + 30 * 60:  # 30 min de gracia después de v4
             log.info(f"Vela ORB {session.upper()} demasiado antigua")
             return None, 0.0, 0.0, 0, 0
         orb_idx = idx
